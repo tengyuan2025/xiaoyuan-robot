@@ -1,0 +1,21 @@
+# xiaoyuan-robot 项目依赖
+# 实时麦克风语音识别系统
+
+# WebSocket 异步通信
+aiohttp>=3.13.2
+
+# 音频处理（麦克风录音）
+PyAudio>=0.2.11
+
+# 注意：PyAudio 在不同系统上的安装方式不同
+# macOS: 需要先安装 portaudio
+#   brew install portaudio
+#   pip install PyAudio
+#
+# Linux (Ubuntu/Debian):
+#   sudo apt-get install portaudio19-dev python3-pyaudio
+#   pip install PyAudio
+#
+# Windows:
+#   pip install PyAudio
+#   (如果失败，可以从 https://www.lfd.uci.edu/~gohlke/pythonlibs/#pyaudio 下载 whl 文件安装)

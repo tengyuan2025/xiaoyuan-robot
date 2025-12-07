@@ -448,3 +448,172 @@ python3 wait_for_service.py
 **记录完成时间**: 2025-12-07 21:10
 **最终状态**: ✅ 成功运行
 **解决问题总数**: 6个（403, 401, 400, 音频格式, 端点选择, 字段命名）
+
+---
+
+## 后续优化和完善
+
+### 1. 优化识别结果显示（2025-12-07 21:21）
+
+**问题**: 每次都打印完整历史结果，造成重复
+
+**解决方案**: 实现增量显示
+- 维护 `last_text` 变量记录上次文本
+- 只显示新增部分
+- 区分临时结果和确定结果
+
+**代码修改**:
+```python
+# receive_responses 方法中
+last_text = ""
+# 提取新增部分
+if current_text.startswith(last_text):
+    new_part = current_text[len(last_text):]
+    print(f"{new_part}", end="", flush=True)
+```
+
+### 2. 指定 USB 外置麦克风（2025-12-07）
+
+**需求**: 只使用 USB 外置麦克风，不使用内置麦克风
+
+**问题**: 
+- 设备索引会动态变化
+- USB 拔掉后程序仍能使用其他设备
+
+**解决方案**: 通过设备名称查找
+- 新增 `find_audio_device_by_name()` 函数
+- 启动时查找名称包含 "USB Audio Device" 的设备
+- 找不到则报错并退出，拒绝使用其他设备
+
+**代码实现**:
+```python
+def find_audio_device_by_name(device_name_keyword):
+    """通过设备名称关键字查找音频设备"""
+    p = pyaudio.PyAudio()
+    for i in range(p.get_device_count()):
+        info = p.get_device_info_by_index(i)
+        if info['maxInputChannels'] > 0 and device_name_keyword.lower() in info['name'].lower():
+            return i, info
+    return None, None
+```
+
+**效果**:
+- USB 未连接时：程序报错并提示插入设备
+- USB 连接后：正常使用，显示 "✓ 已锁定 USB 外置麦克风"
+
+### 3. 创建依赖管理文件
+
+**需求**: 方便在其他电脑上部署项目
+
+**创建的文件**:
+
+#### requirements.txt
+```
+aiohttp>=3.13.2
+PyAudio>=0.2.11
+```
+
+包含不同系统的安装说明注释。
+
+#### INSTALL.md
+完整的安装指南，包含：
+- 系统要求
+- 不同操作系统的安装步骤（macOS/Linux/Windows）
+- API 密钥配置
+- 验证安装
+- 常见问题解决
+- 文件说明
+
+**一键安装命令**:
+```bash
+# macOS
+brew install portaudio ffmpeg
+pip install -r requirements.txt
+
+# Linux
+sudo apt-get install portaudio19-dev ffmpeg
+pip install -r requirements.txt
+```
+
+---
+
+## 项目最终文件结构
+
+```
+xiaoyuan-robot/
+├── realtime_mic_asr.py           # 实时麦克风语音识别（主程序）
+├── list_audio_devices.py         # 音频设备列表工具
+├── test_credentials.py           # API 配置测试工具
+├── wait_for_service.py           # 服务激活等待工具
+├── requirements.txt              # Python 依赖列表
+├── INSTALL.md                    # 安装指南
+├── CLAUDE.md                     # 项目架构文档
+├── chat_history.md               # 完整开发记录（本文件）
+├── README_MIC_ASR.md            # 原始说明文档
+├── sauc_python/
+│   ├── sauc_websocket_demo.py   # 文件音频识别 demo
+│   └── readme.md                # demo 说明
+└── venv/                         # Python 虚拟环境
+```
+
+---
+
+## 核心功能总结
+
+### ✅ 已实现功能
+
+1. **实时语音识别**
+   - WebSocket 长连接
+   - 流式音频传输
+   - 实时结果显示
+
+2. **USB 设备锁定**
+   - 强制使用外置 USB 麦克风
+   - 设备断开自动报错
+   - 防止误用内置麦克风
+
+3. **增量结果显示**
+   - 避免重复打印
+   - 临时结果逐字累加
+   - 确定结果单独标记
+
+4. **完善的工具链**
+   - 设备列表查看
+   - API 配置测试
+   - 服务激活等待
+   - 依赖管理
+
+5. **跨平台支持**
+   - macOS
+   - Linux
+   - Windows
+
+### 📊 技术栈
+
+- **Python 3.9+**
+- **PyAudio** - 音频采集
+- **aiohttp** - 异步 WebSocket
+- **豆包 ASR API** - 语音识别服务
+
+### 🎯 关键技术点
+
+1. **二进制 WebSocket 协议**
+   - 自定义协议头
+   - GZIP 压缩
+   - 序列号管理
+
+2. **异步音频流处理**
+   - PyAudio 回调 + asyncio
+   - Queue 队列缓冲
+   - 双向并发通信
+
+3. **设备管理**
+   - 动态设备查找
+   - 名称匹配而非索引
+   - 严格的设备验证
+
+---
+
+**最后更新时间**: 2025-12-07 21:35
+**项目状态**: ✅ 完整可用，已部署依赖管理
+**总计解决问题**: 8个
