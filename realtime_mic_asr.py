@@ -244,20 +244,31 @@ class ResponseParser:
 class MicrophoneRecorder:
     """麦克风录音器"""
 
-    def __init__(self):
+    def __init__(self, device_index=None):
         self.audio = pyaudio.PyAudio()
         self.stream = None
         self.is_recording = False
         self.audio_queue = Queue()
+        self.device_index = device_index
 
     def start_recording(self):
         """开始录音"""
         try:
+            # 获取设备信息
+            if self.device_index is not None:
+                device_info = self.audio.get_device_info_by_index(self.device_index)
+                device_name = device_info['name']
+                logger.info(f"使用音频设备: [{self.device_index}] {device_name}")
+            else:
+                device_name = "默认设备"
+                logger.info(f"使用音频设备: {device_name}")
+
             self.stream = self.audio.open(
                 format=pyaudio.paInt16,
                 channels=CHANNELS,
                 rate=SAMPLE_RATE,
                 input=True,
+                input_device_index=self.device_index,
                 frames_per_buffer=CHUNK_SIZE,
                 stream_callback=self._audio_callback
             )
@@ -299,11 +310,11 @@ class MicrophoneRecorder:
 class RealtimeMicASRClient:
     """实时麦克风ASR客户端"""
 
-    def __init__(self):
+    def __init__(self, device_index=0):
         self.seq = 1
         self.conn = None
         self.session = None
-        self.recorder = MicrophoneRecorder()
+        self.recorder = MicrophoneRecorder(device_index=device_index)
         self.is_running = False
 
     async def __aenter__(self):
@@ -487,6 +498,25 @@ def signal_handler(sig, frame):
     sys.exit(0)
 
 
+def find_audio_device_by_name(device_name_keyword):
+    """通过设备名称关键字查找音频设备"""
+    p = pyaudio.PyAudio()
+    device_index = None
+    device_info = None
+
+    # 遍历所有设备
+    for i in range(p.get_device_count()):
+        info = p.get_device_info_by_index(i)
+        # 检查是否是输入设备，且名称匹配
+        if info['maxInputChannels'] > 0 and device_name_keyword.lower() in info['name'].lower():
+            device_index = i
+            device_info = info
+            break
+
+    p.terminate()
+    return device_index, device_info
+
+
 async def main():
     """主函数"""
     global client_instance
@@ -495,18 +525,40 @@ async def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
+    # 查找 USB Audio Device
+    required_device_name = "USB Audio Device"  # 必须使用的设备名称
+    device_index, device_info = find_audio_device_by_name(required_device_name)
+
+    if device_index is None:
+        print("=" * 60)
+        print("❌ 错误：未找到 USB 外置麦克风")
+        print("=" * 60)
+        print(f"\n无法找到设备: {required_device_name}")
+        print("\n请确保：")
+        print("  1. USB 麦克风已正确连接到电脑")
+        print("  2. 系统已识别该设备")
+        print("  3. 设备名称包含 'USB Audio Device'")
+        print("\n运行以下命令查看所有可用设备：")
+        print("  python3 list_audio_devices.py")
+        print("\n" + "=" * 60)
+        sys.exit(1)
+
+    device_name = device_info['name']
+
     print("=" * 60)
     print("实时麦克风语音识别")
     print("=" * 60)
     print(f"配置信息:")
+    print(f"  - 音频设备: [{device_index}] {device_name}")
     print(f"  - 采样率: {SAMPLE_RATE}Hz")
     print(f"  - 声道数: {CHANNELS}")
     print(f"  - 位深: {BITS_PER_SAMPLE}bit")
     print(f"  - 服务: {WSS_URL}")
     print("=" * 60)
-    print("\n请对着麦克风说话，按 Ctrl+C 停止...\n")
+    print("\n✓ 已锁定 USB 外置麦克风")
+    print("请对着麦克风说话，按 Ctrl+C 停止...\n")
 
-    async with RealtimeMicASRClient() as client:
+    async with RealtimeMicASRClient(device_index=device_index) as client:
         client_instance = client
         try:
             await client.run()
