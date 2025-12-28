@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(del \"E:\\\\claude_projects\\\\eve\\\\chatbot\\\\豆包三大模型精简API文档（含调用参数+错误码+Python示例）.md\")",
+      "Bash(ren \"E:\\\\claude_projects\\\\eve\\\\chatbot\\\\secrets.example.py\" \"api_secrets.example.py\")",
+      "Bash(cmd /c \"ren E:\\\\claude_projects\\\\eve\\\\chatbot\\\\secrets.example.py api_secrets.example.py\")",
+      "Bash(dir:*)",
+      "Bash(python -m py_compile:*)"
+    ]
+  }
+}

@@ -22,6 +22,7 @@ import tempfile
 import uuid
 import struct
 import gzip
+import time
 from typing import Optional, List, Dict
 
 # PyQt6 图形界面
@@ -48,7 +49,7 @@ from config import (
     SILENCE_THRESHOLD, SILENCE_TIMEOUT, FINAL_WAIT_TIMEOUT,
     # 对话模型配置
     CHAT_API_KEY, CHAT_API_URL, CHAT_MODEL_NAME,
-    CHAT_MAX_TOKENS, CHAT_TEMPERATURE, CHAT_REASONING_EFFORT,
+    CHAT_MAX_TOKENS, CHAT_TEMPERATURE, CHAT_STREAM, CHAT_THINKING,
     # 语音合成配置
     TTS_APPID, TTS_ACCESS_TOKEN, TTS_WS_URL, TTS_RESOURCE_ID,
     TTS_SPEAKER, TTS_FORMAT, TTS_SAMPLE_RATE, TTS_SPEECH_RATE, TTS_LOUDNESS_RATE,
@@ -70,7 +71,8 @@ class WorkerSignals(QObject):
 
     # 对话模型相关信号
     chat_thinking = pyqtSignal()            # AI 正在思考
-    chat_reply = pyqtSignal(str)            # AI 回复完成
+    chat_chunk = pyqtSignal(str)            # AI 流式回复片段
+    chat_reply = pyqtSignal(str)            # AI 回复完成（完整文本）
     chat_error = pyqtSignal(str)            # 对话错误
 
     # 语音合成相关信号
@@ -87,7 +89,7 @@ class WorkerSignals(QObject):
 class AudioRecorder:
     """
     音频录制器
-    负责从麦克风采集 PCM 音频数据
+    负责从麦克风采集 PCM 音频数据，支持缓冲区存储
     """
 
     def __init__(self):
@@ -95,23 +97,7 @@ class AudioRecorder:
         self.stream = None
         self.is_recording = False
         self.audio_queue = queue.Queue()
-
-    def list_devices(self):
-        """列出所有可用的音频输入设备"""
-        p = pyaudio.PyAudio()
-        print("\n[AudioRecorder] 可用的音频输入设备:")
-        print("-" * 60)
-        input_devices = []
-        for i in range(p.get_device_count()):
-            dev = p.get_device_info_by_index(i)
-            if dev['maxInputChannels'] > 0:  # 只显示输入设备
-                input_devices.append(i)
-                default_mark = " [默认]" if i == p.get_default_input_device_info()['index'] else ""
-                print(f"  设备 {i}: {dev['name']}{default_mark}")
-                print(f"          输入通道: {dev['maxInputChannels']}, 采样率: {dev['defaultSampleRate']}")
-        print("-" * 60)
-        p.terminate()
-        return input_devices
+        self.audio_buffer: List[bytes] = []  # 音频缓冲区，用于存储连接建立前的音频
 
     def start(self, device_index: int = None) -> bool:
         """
@@ -125,18 +111,12 @@ class AudioRecorder:
         """
         try:
             self.p = pyaudio.PyAudio()
-
-            # 列出设备信息
-            self.list_devices()
+            self.audio_buffer = []  # 清空缓冲区
 
             # 获取默认设备信息
             if device_index is None:
                 default_dev = self.p.get_default_input_device_info()
                 device_index = default_dev['index']
-                print(f"[AudioRecorder] 使用默认设备: {device_index} - {default_dev['name']}")
-            else:
-                dev = self.p.get_device_info_by_index(device_index)
-                print(f"[AudioRecorder] 使用指定设备: {device_index} - {dev['name']}")
 
             self.stream = self.p.open(
                 format=pyaudio.paInt16,     # 16-bit 采样
@@ -170,6 +150,29 @@ class AudioRecorder:
         except Exception as e:
             print(f"[AudioRecorder] 读取音频失败: {e}")
             return None
+
+    def read_chunk_to_buffer(self) -> Optional[bytes]:
+        """
+        读取一帧音频数据并存入缓冲区
+
+        Returns:
+            bytes: 音频数据，如果未在录音则返回 None
+        """
+        data = self.read_chunk()
+        if data:
+            self.audio_buffer.append(data)
+        return data
+
+    def get_buffered_audio(self) -> List[bytes]:
+        """
+        获取并清空缓冲区中的音频数据
+
+        Returns:
+            List[bytes]: 缓冲区中的音频帧列表
+        """
+        buffered = self.audio_buffer
+        self.audio_buffer = []
+        return buffered
 
     def stop(self):
         """停止录音"""
@@ -214,13 +217,23 @@ class ASRWorker(QThread):
         """线程主函数"""
         self.is_running = True
         self.final_text = ""
+        self.ws_ready = False  # WebSocket 连接是否就绪
 
-        # 启动录音
+        # 先启动录音，不等待连接
         if not self.recorder.start():
             self.signals.asr_error.emit("麦克风启动失败，请检查设备连接")
             return
 
         self.signals.recording_started.emit()
+
+        # 启动后台线程持续采集音频到缓冲区（在连接建立前）
+        def buffer_audio():
+            while self.is_running and not self.ws_ready:
+                self.recorder.read_chunk_to_buffer()
+                time.sleep(0.01)  # 避免CPU占用过高
+
+        buffer_thread = threading.Thread(target=buffer_audio, daemon=True)
+        buffer_thread.start()
 
         # 运行异步事件循环
         try:
@@ -388,7 +401,8 @@ class ASRWorker(QThread):
         流程：
         1. 建立 WebSocket 连接（使用正确的 HTTP Header 鉴权）
         2. 发送初始化参数（二进制协议）
-        3. 并行发送音频帧和接收识别结果
+        3. 发送缓冲区中的音频（在连接建立前已录制的）
+        4. 并行发送音频帧和接收识别结果
         """
         try:
             # 构造正确的请求头（根据完整文档）
@@ -425,15 +439,18 @@ class ASRWorker(QThread):
                         "show_utterances": True,  # 启用分句信息
                         "result_type": "full",
                         "enable_accelerate_text": True,  # 加速首字返回
-                        "accelerate_score": 15,  # 加速率 0-20，越大越快
-                        "end_window_size": 1500,  # 服务端静音判停时间(ms)，默认800，增大避免过早截断
-                        "force_to_speech_time": 500  # 强制语音时间(ms)，音频超过此时长后才判停
+                        "accelerate_score": 20,  # 加速率 0-20，越大越快（最大加速）
+                        "end_window_size": 800,  # 服务端静音判停时间(ms)，默认800
+                        "force_to_speech_time": 300  # 强制语音时间(ms)，音频超过此时长后才判停
                     }
                 }
 
                 # 发送 full client request（二进制协议）
                 request_packet = self._build_full_client_request(init_params)
                 await websocket.send(request_packet)
+
+                # 标记连接就绪，停止缓冲线程
+                self.ws_ready = True
 
                 # 并行任务：发送音频 + 接收结果
                 send_task = asyncio.create_task(self._send_audio(websocket))
@@ -457,32 +474,41 @@ class ASRWorker(QThread):
         Args:
             websocket: WebSocket 连接对象
         """
-        import time
         import array
 
         frame_count = 0
-        all_audio_data = b""  # 收集所有音频数据用于调试
         max_amplitude = 0
-        total_amplitude = 0
 
         # 静音检测相关
         last_voice_time = time.time()  # 最后检测到声音的时间
         has_detected_voice = False  # 是否已检测到过声音
 
         try:
+            # 先发送缓冲区中的音频（在连接建立前已录制的）
+            buffered_frames = self.recorder.get_buffered_audio()
+            if buffered_frames:
+                print(f"[ASR] 发送缓冲区中的 {len(buffered_frames)} 帧音频")
+                for audio_data in buffered_frames:
+                    audio_packet = self._build_audio_request(audio_data, is_last=False, use_gzip=False)
+                    await websocket.send(audio_packet)
+                    frame_count += 1
+
+                    # 检测缓冲区音频中是否有声音
+                    samples = array.array('h', audio_data)
+                    frame_max = max(abs(s) for s in samples) if samples else 0
+                    max_amplitude = max(max_amplitude, frame_max)
+                    if frame_max > SILENCE_THRESHOLD:
+                        last_voice_time = time.time()
+                        has_detected_voice = True
+
+            # 继续发送实时录制的音频
             while self.is_running:
-                # 读取音频帧
                 audio_data = self.recorder.read_chunk()
                 if audio_data:
-                    # 收集音频数据用于调试
-                    all_audio_data += audio_data
-
                     # 计算音频振幅（检测是否有有效声音）
-                    samples = array.array('h', audio_data)  # 16-bit signed samples
+                    samples = array.array('h', audio_data)
                     frame_max = max(abs(s) for s in samples) if samples else 0
-                    frame_avg = sum(abs(s) for s in samples) // len(samples) if samples else 0
                     max_amplitude = max(max_amplitude, frame_max)
-                    total_amplitude += frame_avg
 
                     # 静音检测：检查是否有声音
                     if frame_max > SILENCE_THRESHOLD:
@@ -493,41 +519,21 @@ class ASRWorker(QThread):
                     if has_detected_voice:
                         silence_duration = time.time() - last_voice_time
                         if silence_duration >= SILENCE_TIMEOUT:
-                            print(f"[ASR] 静音超时 {SILENCE_TIMEOUT}秒，自动结束录音")
+                            print(f"[ASR] 静音 {SILENCE_TIMEOUT}秒，自动结束")
                             self.is_running = False
                             break
 
-                    # 构建音频请求包（不使用压缩，直接发送原始音频）
+                    # 构建音频请求包
                     audio_packet = self._build_audio_request(audio_data, is_last=False, use_gzip=False)
                     await websocket.send(audio_packet)
                     frame_count += 1
                 else:
                     await asyncio.sleep(0.01)
 
-            # 发送结束帧（最后一包）
+            # 发送结束帧
             end_packet = self._build_audio_request(b"", is_last=True, use_gzip=False)
             await websocket.send(end_packet)
-
-            # 打印音频统计信息
-            avg_amplitude = total_amplitude // frame_count if frame_count > 0 else 0
-            print(f"[ASR] 共发送 {frame_count} 帧音频")
-            print(f"[ASR] 音频统计: 最大振幅={max_amplitude}, 平均振幅={avg_amplitude}")
-            print(f"[ASR] 总音频大小: {len(all_audio_data)} 字节, 时长约 {len(all_audio_data) / 32000:.2f} 秒")
-
-            # 判断音频是否有效
-            if max_amplitude < 500:
-                print(f"[ASR] 警告: 音频振幅很低，可能麦克风没有声音或静音！")
-            elif max_amplitude < 2000:
-                print(f"[ASR] 提示: 音频振幅较低，说话声音可能较小")
-            else:
-                print(f"[ASR] 音频振幅正常")
-
-            # 保存音频文件用于调试
-            debug_audio_path = os.path.join(os.path.dirname(__file__), "debug_audio.pcm")
-            with open(debug_audio_path, "wb") as f:
-                f.write(all_audio_data)
-            print(f"[ASR] 已保存调试音频到: {debug_audio_path}")
-            print(f"[ASR] 可使用 ffplay -f s16le -ar 16000 -ac 1 {debug_audio_path} 播放")
+            print(f"[ASR] 共发送 {frame_count} 帧，最大振幅 {max_amplitude}")
 
         except Exception as e:
             print(f"[ASR] 发送音频异常: {e}")
@@ -649,12 +655,12 @@ class ASRWorker(QThread):
         self.recorder.stop()
 
 
-# ==================== 文本对话模块 ====================
+# ==================== 文本对话模块（流式版本） ====================
 class ChatWorker(QThread):
     """
-    文本对话工作线程
+    文本对话工作线程（流式版本）
 
-    负责调用 Doubao-Seed-1.6 模型进行对话
+    负责流式调用 Doubao-Seed-1.6 模型进行对话，实时返回文本片段
     """
 
     def __init__(self, signals: WorkerSignals):
@@ -662,6 +668,7 @@ class ChatWorker(QThread):
         self.signals = signals
         self.user_input = ""
         self.history: List[Dict[str, str]] = []
+        self.is_running = True
 
     def set_input(self, text: str, history: List[Dict[str, str]] = None):
         """
@@ -674,80 +681,128 @@ class ChatWorker(QThread):
         self.user_input = text
         self.history = history or []
 
+    def stop(self):
+        """停止对话"""
+        self.is_running = False
+
     def run(self):
         """线程主函数"""
         if not self.user_input.strip():
             self.signals.chat_error.emit("输入文本为空")
             return
 
+        self.is_running = True
+
         # 发送"正在思考"信号
         self.signals.chat_thinking.emit()
 
-        # 调用对话模型
-        reply = self._call_chat_api()
+        # 流式调用对话模型
+        full_reply = self._call_chat_api_stream()
 
-        if reply:
-            self.signals.chat_reply.emit(reply)
-        else:
+        if full_reply:
+            self.signals.chat_reply.emit(full_reply)
+        elif self.is_running:  # 只有在非中断情况下才报错
             self.signals.chat_error.emit("对话模型调用失败")
 
-    def _call_chat_api(self) -> Optional[str]:
+    def _call_chat_api_stream(self) -> Optional[str]:
         """
-        调用 Doubao-Seed-1.6 对话 API
+        流式调用 Doubao-Seed-1.6 对话 API
 
         Returns:
-            str: AI 回复文本，失败返回 None
+            str: AI 完整回复文本，失败返回 None
         """
         headers = {
             "Authorization": f"Bearer {CHAT_API_KEY}",
             "Content-Type": "application/json"
         }
 
-        # 构造请求体
-        messages = self.history + [{"role": "user", "content": self.user_input}]
+        # 构造请求体（精简历史，只保留最近2轮对话）
+        recent_history = self.history[-4:] if len(self.history) > 4 else self.history
+        messages = recent_history + [{"role": "user", "content": self.user_input}]
         data = {
             "model": CHAT_MODEL_NAME,
             "messages": messages,
-            "reasoning_effort": CHAT_REASONING_EFFORT,
             "max_completion_tokens": CHAT_MAX_TOKENS,
-            "temperature": CHAT_TEMPERATURE
+            "temperature": CHAT_TEMPERATURE,
+            "stream": CHAT_STREAM  # 开启流式返回
         }
 
-        # 重试机制
-        for attempt in range(MAX_RETRIES):
-            try:
-                response = requests.post(
-                    CHAT_API_URL,
-                    headers=headers,
-                    data=json.dumps(data),
-                    timeout=REQUEST_TIMEOUT
-                )
-                response.raise_for_status()
+        # 如果配置了 thinking 参数，添加到请求中
+        if CHAT_THINKING:
+            data["thinking"] = {"type": CHAT_THINKING}
 
-                res_json = response.json()
+        print(f"[Chat] 发送流式请求: model={CHAT_MODEL_NAME}, stream={CHAT_STREAM}")
 
-                # 检查响应格式（兼容 OpenAI 格式）
-                if "choices" in res_json:
-                    # OpenAI 兼容格式
-                    reply = res_json["choices"][0]["message"]["content"]
-                    return reply
-                elif res_json.get("code") == 0:
-                    # 豆包原生格式
-                    reply = res_json["data"]["choices"][0]["message"]["content"]
-                    return reply
-                else:
-                    error_msg = res_json.get("msg", res_json.get("error", {}).get("message", "未知错误"))
-                    print(f"[Chat] 对话错误: {res_json.get('code', 'N/A')} - {error_msg}")
+        try:
+            response = requests.post(
+                CHAT_API_URL,
+                headers=headers,
+                data=json.dumps(data),
+                timeout=REQUEST_TIMEOUT,
+                stream=True  # 开启流式响应
+            )
+            response.raise_for_status()
 
-            except requests.exceptions.Timeout:
-                print(f"[Chat] 请求超时，重试 {attempt + 1}/{MAX_RETRIES}")
-            except requests.exceptions.RequestException as e:
-                print(f"[Chat] 请求异常: {e}")
-            except (KeyError, IndexError, json.JSONDecodeError) as e:
-                print(f"[Chat] 解析响应失败: {e}")
-                break
+            full_reply = ""
 
-        return None
+            # 逐行解析流式返回
+            for line in response.iter_lines():
+                if not self.is_running:
+                    print("[Chat] 流式请求被中断")
+                    break
+
+                if line:
+                    line_str = line.decode('utf-8')
+
+                    # 跳过空行和注释
+                    if not line_str.strip() or line_str.startswith(':'):
+                        continue
+
+                    # 去掉 "data: " 前缀
+                    if line_str.startswith('data: '):
+                        line_str = line_str[6:]
+
+                    # 检查是否结束
+                    if line_str.strip() == '[DONE]':
+                        print("[Chat] 流式传输完成")
+                        break
+
+                    try:
+                        res = json.loads(line_str)
+
+                        # 检查错误
+                        if res.get("error"):
+                            error_msg = res.get("error", {}).get("message", "未知错误")
+                            print(f"[Chat] 流式响应错误: {error_msg}")
+                            continue
+
+                        # 提取片段文本（OpenAI 兼容格式）
+                        choices = res.get("choices", [])
+                        if choices:
+                            delta = choices[0].get("delta", {})
+                            chunk = delta.get("content", "")
+                            if chunk:
+                                full_reply += chunk
+                                # 发送流式片段信号
+                                self.signals.chat_chunk.emit(chunk)
+
+                    except json.JSONDecodeError:
+                        # 非 JSON 行，跳过
+                        continue
+
+            return full_reply if full_reply else None
+
+        except requests.exceptions.Timeout:
+            print(f"[Chat] 流式请求超时")
+            return None
+        except requests.exceptions.RequestException as e:
+            print(f"[Chat] 流式请求异常: {e}")
+            return None
+        except Exception as e:
+            print(f"[Chat] 流式处理异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
 
 # ==================== 语音合成与播放模块 ====================
@@ -1143,6 +1198,455 @@ class TTSWorker(QThread):
             raise
 
 
+# ==================== 流式TTS模块（分段合成+边说边播） ====================
+class StreamingTTSWorker(QThread):
+    """
+    流式语音合成工作线程
+
+    功能：
+    1. 接收文本片段，按标点切分成句子
+    2. 每个句子立即调用 TTS 合成
+    3. 将合成的音频片段放入队列
+    4. 后台线程按顺序无缝播放队列中的音频
+
+    实现"边生成边播放"，大幅减少等待时间
+    """
+
+    # 句子分隔符（按这些标点切分）
+    SENTENCE_DELIMITERS = ["。", "！", "？", "；", "\n", "!", "?", ";"]
+
+    def __init__(self, signals: WorkerSignals):
+        super().__init__()
+        self.signals = signals
+        self.text_buffer = ""  # 文本缓冲区
+        self.audio_queue = queue.Queue()  # 音频片段队列
+        self.chunk_id = 0  # 片段序号
+        self.is_running = True
+        self.is_finished = False  # 标记文本是否全部接收完毕
+        self.first_audio_played = False  # 标记是否已播放第一个音频
+        self.play_thread: Optional[threading.Thread] = None
+        self.tts_threads: List[threading.Thread] = []
+
+        # 复用 TTSWorker 的协议常量
+        self.EVENT_START_CONNECTION = 1
+        self.EVENT_FINISH_CONNECTION = 2
+        self.EVENT_CONNECTION_STARTED = 50
+        self.EVENT_START_SESSION = 100
+        self.EVENT_FINISH_SESSION = 102
+        self.EVENT_SESSION_STARTED = 150
+        self.EVENT_SESSION_FINISHED = 152
+        self.EVENT_SESSION_FAILED = 153
+        self.EVENT_TASK_REQUEST = 200
+        self.EVENT_TTS_RESPONSE = 352
+
+    def add_text_chunk(self, chunk: str):
+        """
+        接收文本片段，累积到缓冲区并尝试切分句子
+
+        Args:
+            chunk: 文本片段
+        """
+        if not self.is_running:
+            return
+
+        self.text_buffer += chunk
+
+        # 按标点切分，提取完整的句子
+        while True:
+            split_idx = -1
+            for delim in self.SENTENCE_DELIMITERS:
+                idx = self.text_buffer.find(delim)
+                if idx != -1:
+                    if split_idx == -1 or idx < split_idx:
+                        split_idx = idx
+
+            if split_idx == -1:
+                break
+
+            # 提取完整句子（包含分隔符）
+            sentence = self.text_buffer[:split_idx + 1].strip()
+            self.text_buffer = self.text_buffer[split_idx + 1:]
+
+            if sentence:
+                # 启动 TTS 合成线程（非阻塞）
+                self._start_tts_synthesis(sentence, self.chunk_id)
+                self.chunk_id += 1
+
+    def finish_text(self):
+        """
+        标记文本接收完毕，处理剩余缓冲区
+        """
+        self.is_finished = True
+
+        # 处理最后剩余的文本
+        if self.text_buffer.strip():
+            self._start_tts_synthesis(self.text_buffer.strip(), self.chunk_id)
+            self.chunk_id += 1
+            self.text_buffer = ""
+
+    def _is_valid_tts_text(self, text: str) -> bool:
+        """
+        检查文本是否适合TTS合成
+
+        过滤掉：纯emoji、纯符号、过短的文本
+
+        Args:
+            text: 待检查文本
+
+        Returns:
+            bool: 是否有效
+        """
+        import re
+        # 去掉emoji和符号后检查是否还有有效字符
+        # 匹配中文、英文、数字
+        valid_chars = re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9]', '', text)
+        return len(valid_chars) >= 2  # 至少2个有效字符
+
+    def _start_tts_synthesis(self, text: str, chunk_id: int):
+        """
+        启动 TTS 合成线程
+
+        Args:
+            text: 待合成的文本
+            chunk_id: 片段序号
+        """
+        # 过滤无效文本（纯emoji、纯符号等）
+        if not self._is_valid_tts_text(text):
+            print(f"[StreamingTTS] 跳过无效片段 {chunk_id}: {text}")
+            return
+
+        print(f"[StreamingTTS] 合成片段 {chunk_id}: {text[:30]}...")
+        tts_thread = threading.Thread(
+            target=self._synthesize_chunk,
+            args=(text, chunk_id),
+            daemon=True
+        )
+        self.tts_threads.append(tts_thread)
+        tts_thread.start()
+
+    def _synthesize_chunk(self, text: str, chunk_id: int):
+        """
+        合成单个文本片段的音频
+
+        Args:
+            text: 待合成文本
+            chunk_id: 片段序号
+        """
+        try:
+            # 使用 asyncio 运行异步合成
+            audio_data = asyncio.run(self._tts_async(text))
+            if audio_data:
+                # 放入队列（带序号保证顺序）
+                self.audio_queue.put((chunk_id, audio_data))
+                print(f"[StreamingTTS] 片段 {chunk_id} 合成完成，{len(audio_data)} 字节")
+            else:
+                print(f"[StreamingTTS] 片段 {chunk_id} 合成失败")
+        except Exception as e:
+            print(f"[StreamingTTS] 片段 {chunk_id} 合成异常: {e}")
+
+    async def _tts_async(self, text: str) -> Optional[bytes]:
+        """
+        异步调用 TTS WebSocket API
+
+        Args:
+            text: 待合成文本
+
+        Returns:
+            音频数据，失败返回 None
+        """
+        try:
+            connect_id = str(uuid.uuid4())
+            headers = {
+                "X-Api-App-Key": TTS_APPID,
+                "X-Api-Access-Key": TTS_ACCESS_TOKEN,
+                "X-Api-Resource-Id": TTS_RESOURCE_ID,
+                "X-Api-Connect-Id": connect_id
+            }
+
+            async with websockets.connect(
+                TTS_WS_URL,
+                additional_headers=headers,
+                ping_interval=20,
+                ping_timeout=10
+            ) as websocket:
+
+                # 1. StartConnection
+                start_conn = self._build_event_request(self.EVENT_START_CONNECTION)
+                await websocket.send(start_conn)
+                response = await asyncio.wait_for(websocket.recv(), timeout=10)
+                res = self._parse_tts_response(response)
+                if res.get("error") or res.get("event") != self.EVENT_CONNECTION_STARTED:
+                    return None
+
+                # 2. StartSession
+                session_id = str(uuid.uuid4())
+                session_params = {
+                    "user": {"uid": str(uuid.uuid4())[:16]},
+                    "event": self.EVENT_START_SESSION,
+                    "namespace": "BidirectionalTTS",
+                    "req_params": {
+                        "text": "",
+                        "speaker": TTS_SPEAKER,
+                        "audio_params": {
+                            "format": TTS_FORMAT,
+                            "sample_rate": TTS_SAMPLE_RATE,
+                            "speech_rate": TTS_SPEECH_RATE,
+                            "loudness_rate": TTS_LOUDNESS_RATE
+                        }
+                    }
+                }
+                start_session = self._build_event_request(
+                    self.EVENT_START_SESSION, session_id, session_params
+                )
+                await websocket.send(start_session)
+                response = await asyncio.wait_for(websocket.recv(), timeout=10)
+                res = self._parse_tts_response(response)
+                if res.get("error") or res.get("event") != self.EVENT_SESSION_STARTED:
+                    return None
+
+                # 3. TaskRequest
+                task_params = {
+                    "event": self.EVENT_TASK_REQUEST,
+                    "req_params": {"text": text}
+                }
+                task_packet = self._build_event_request(
+                    self.EVENT_TASK_REQUEST, session_id, task_params
+                )
+                await websocket.send(task_packet)
+
+                # 4. FinishSession
+                finish_session = self._build_event_request(
+                    self.EVENT_FINISH_SESSION, session_id
+                )
+                await websocket.send(finish_session)
+
+                # 5. 接收音频数据
+                audio_data = b""
+                while True:
+                    try:
+                        response = await asyncio.wait_for(websocket.recv(), timeout=15)
+                        res = self._parse_tts_response(response)
+
+                        if res.get("error"):
+                            break
+
+                        if res.get("audio"):
+                            audio_data += res["audio"]
+
+                        if res.get("event") == self.EVENT_SESSION_FINISHED:
+                            break
+
+                        if res.get("event") == self.EVENT_SESSION_FAILED:
+                            break
+
+                    except asyncio.TimeoutError:
+                        break
+
+                # 6. FinishConnection
+                finish_conn = self._build_event_request(self.EVENT_FINISH_CONNECTION)
+                await websocket.send(finish_conn)
+
+                return audio_data if audio_data else None
+
+        except Exception as e:
+            print(f"[StreamingTTS] TTS 异步调用异常: {e}")
+            return None
+
+    def _build_event_request(self, event: int, session_id: str = "",
+                             payload: dict = None) -> bytes:
+        """构建 TTS 请求包（复用 TTSWorker 的协议）"""
+        byte0 = 0x11
+        byte1 = (0b0001 << 4) | 0b0100  # Full client request with event
+        byte2 = (0b0001 << 4) | 0b0000  # JSON, no compression
+        byte3 = 0x00
+        header = bytes([byte0, byte1, byte2, byte3])
+
+        event_bytes = struct.pack('>I', event)
+        result = header + event_bytes
+
+        if event in (self.EVENT_START_SESSION, self.EVENT_FINISH_SESSION,
+                     self.EVENT_TASK_REQUEST):
+            session_id_bytes = session_id.encode('utf-8')
+            session_id_size = struct.pack('>I', len(session_id_bytes))
+            result += session_id_size + session_id_bytes
+
+        if payload is None:
+            payload = {}
+        payload_bytes = json.dumps(payload).encode('utf-8')
+        payload_size = struct.pack('>I', len(payload_bytes))
+        result += payload_size + payload_bytes
+
+        return result
+
+    def _parse_tts_response(self, data: bytes) -> dict:
+        """解析 TTS 响应（复用 TTSWorker 的解析逻辑）"""
+        if len(data) < 4:
+            return {"error": True}
+
+        header = data[:4]
+        message_type = (header[1] >> 4) & 0x0F
+        message_type_flags = header[1] & 0x0F
+        compression = header[2] & 0x0F
+
+        offset = 4
+        result = {"message_type": message_type}
+
+        # 错误帧
+        if message_type == 0b1111:
+            if len(data) >= offset + 4:
+                error_code = struct.unpack('>I', data[offset:offset+4])[0]
+                return {"error": True, "code": error_code}
+            return {"error": True}
+
+        # 解析事件号
+        if message_type_flags == 0b0100:
+            if len(data) >= offset + 4:
+                event = struct.unpack('>I', data[offset:offset+4])[0]
+                result["event"] = event
+                offset += 4
+
+        # 音频响应
+        if message_type == 0b1011:
+            if len(data) >= offset + 4:
+                session_id_size = struct.unpack('>I', data[offset:offset+4])[0]
+                offset += 4 + session_id_size
+
+            if len(data) >= offset + 4:
+                audio_size = struct.unpack('>I', data[offset:offset+4])[0]
+                offset += 4
+                if len(data) >= offset + audio_size:
+                    result["audio"] = data[offset:offset+audio_size]
+            return result
+
+        # Full server response
+        if message_type == 0b1001:
+            event = result.get("event", 0)
+            if event in (self.EVENT_SESSION_STARTED, self.EVENT_SESSION_FINISHED,
+                         self.EVENT_SESSION_FAILED):
+                if len(data) >= offset + 4:
+                    session_id_size = struct.unpack('>I', data[offset:offset+4])[0]
+                    offset += 4 + session_id_size
+
+            elif event == self.EVENT_CONNECTION_STARTED:
+                if len(data) >= offset + 4:
+                    conn_id_size = struct.unpack('>I', data[offset:offset+4])[0]
+                    offset += 4 + conn_id_size
+
+        return result
+
+    def run(self):
+        """线程主函数：启动音频播放线程"""
+        self.is_running = True
+        self.first_audio_played = False  # 标记是否已播放第一个音频
+
+        # 启动播放线程
+        self.play_thread = threading.Thread(target=self._play_audio_queue, daemon=True)
+        self.play_thread.start()
+
+        # 等待播放完成
+        self.play_thread.join()
+
+        if self.is_running:
+            self.signals.tts_finished.emit()
+
+    def _play_audio_queue(self):
+        """消费音频队列，按顺序无缝播放"""
+        import io
+
+        try:
+            pygame.mixer.init()
+        except Exception as e:
+            print(f"[StreamingTTS] pygame 初始化失败: {e}")
+            return
+
+        last_chunk_id = -1
+        pending_chunks = {}  # 暂存乱序到达的片段
+        empty_count = 0
+        max_empty_wait = 100  # 最大空等次数（10秒）
+
+        while self.is_running:
+            try:
+                # 非阻塞获取
+                try:
+                    chunk_id, audio_data = self.audio_queue.get(timeout=0.1)
+                    empty_count = 0
+
+                    # 如果是下一个期望的片段，直接播放
+                    if chunk_id == last_chunk_id + 1:
+                        self._play_chunk(audio_data)
+                        last_chunk_id = chunk_id
+
+                        # 检查暂存区是否有后续片段
+                        while last_chunk_id + 1 in pending_chunks:
+                            next_audio = pending_chunks.pop(last_chunk_id + 1)
+                            self._play_chunk(next_audio)
+                            last_chunk_id += 1
+                    else:
+                        # 乱序到达，暂存
+                        pending_chunks[chunk_id] = audio_data
+
+                except queue.Empty:
+                    empty_count += 1
+
+                    # 检查是否所有片段都已处理完毕
+                    if self.is_finished and self.audio_queue.empty() and not pending_chunks:
+                        # 等待所有 TTS 线程完成
+                        all_done = True
+                        for t in self.tts_threads:
+                            if t.is_alive():
+                                all_done = False
+                                break
+
+                        if all_done and self.audio_queue.empty() and not pending_chunks:
+                            print("[StreamingTTS] 所有片段播放完成")
+                            break
+
+                    # 超时退出
+                    if empty_count > max_empty_wait and self.is_finished:
+                        print("[StreamingTTS] 等待超时，退出播放")
+                        break
+
+            except Exception as e:
+                print(f"[StreamingTTS] 播放队列处理异常: {e}")
+                break
+
+        try:
+            pygame.mixer.quit()
+        except:
+            pass
+
+    def _play_chunk(self, audio_data: bytes):
+        """播放单个音频片段"""
+        import io
+
+        try:
+            # 在播放第一个音频片段时发送 tts_started 信号
+            if not self.first_audio_played:
+                self.first_audio_played = True
+                self.signals.tts_started.emit()
+                print("[StreamingTTS] 开始播放第一个音频片段")
+
+            audio_file = io.BytesIO(audio_data)
+            pygame.mixer.music.load(audio_file)
+            pygame.mixer.music.play()
+
+            # 等待播放完成
+            while pygame.mixer.music.get_busy() and self.is_running:
+                pygame.time.Clock().tick(10)
+
+        except Exception as e:
+            print(f"[StreamingTTS] 播放片段失败: {e}")
+
+    def stop(self):
+        """停止播放"""
+        self.is_running = False
+        try:
+            if pygame.mixer.get_init():
+                pygame.mixer.music.stop()
+        except:
+            pass
+
+
 # ==================== 主界面 ====================
 class VoiceAssistantWindow(QMainWindow):
     """
@@ -1165,6 +1669,7 @@ class VoiceAssistantWindow(QMainWindow):
         self.asr_worker: Optional[ASRWorker] = None
         self.chat_worker: Optional[ChatWorker] = None
         self.tts_worker: Optional[TTSWorker] = None
+        self.streaming_tts_worker: Optional[StreamingTTSWorker] = None  # 流式 TTS
 
         # 对话历史
         self.chat_history: List[Dict[str, str]] = []
@@ -1173,6 +1678,14 @@ class VoiceAssistantWindow(QMainWindow):
         self.is_recording = False
         self.is_tts_playing = False  # TTS 是否正在播放
         self.current_asr_text = ""
+        self.current_ai_text = ""  # AI 回复文本（流式累积）
+
+        # 计时统计（用于性能分析）
+        self.time_asr_end = 0.0          # 语音识别完成时间
+        self.time_chat_first = 0.0       # Chat第一个chunk到达时间
+        self.time_tts_first_synth = 0.0  # TTS第一个片段合成完成时间
+        self.time_tts_play_start = 0.0   # TTS开始播放时间
+        self.is_first_chunk = True       # 是否第一个chunk
 
         # 初始化界面
         self._init_ui()
@@ -1265,6 +1778,39 @@ class VoiceAssistantWindow(QMainWindow):
         # ========== 底部控制区域 ==========
         bottom_layout = QVBoxLayout()
         bottom_layout.setSpacing(10)
+
+        # 耗时统计显示区域
+        timing_frame = QFrame()
+        timing_frame.setStyleSheet("""
+            QFrame {
+                background-color: #fff8e1;
+                border: 1px solid #ffe082;
+                border-radius: 6px;
+                padding: 5px;
+            }
+        """)
+        timing_layout = QHBoxLayout(timing_frame)
+        timing_layout.setContentsMargins(10, 5, 10, 5)
+        timing_layout.setSpacing(20)
+
+        # 各阶段耗时标签
+        self.timing_asr_chat = QLabel("ASR→首字: --")
+        self.timing_asr_chat.setFont(QFont("Microsoft YaHei", 9))
+        self.timing_asr_chat.setStyleSheet("color: #795548; border: none;")
+        timing_layout.addWidget(self.timing_asr_chat)
+
+        self.timing_chat_tts = QLabel("首字→播放: --")
+        self.timing_chat_tts.setFont(QFont("Microsoft YaHei", 9))
+        self.timing_chat_tts.setStyleSheet("color: #795548; border: none;")
+        timing_layout.addWidget(self.timing_chat_tts)
+
+        self.timing_total = QLabel("总延时: --")
+        self.timing_total.setFont(QFont("Microsoft YaHei", 9, QFont.Weight.Bold))
+        self.timing_total.setStyleSheet("color: #e65100; border: none;")
+        timing_layout.addWidget(self.timing_total)
+
+        timing_layout.addStretch()
+        bottom_layout.addWidget(timing_frame)
 
         # 状态显示
         self.status_label = QLabel("点击麦克风按钮开始对话")
@@ -1362,6 +1908,7 @@ class VoiceAssistantWindow(QMainWindow):
 
         # 对话模型信号
         self.signals.chat_thinking.connect(self._on_chat_thinking)
+        self.signals.chat_chunk.connect(self._on_chat_chunk)  # 流式片段
         self.signals.chat_reply.connect(self._on_chat_reply)
         self.signals.chat_error.connect(self._on_chat_error)
 
@@ -1395,9 +1942,17 @@ class VoiceAssistantWindow(QMainWindow):
         except Exception as e:
             print(f"[UI] 停止播放异常: {e}")
 
-        # 停止 TTS 工作线程
+        # 停止流式 TTS 工作线程
+        if self.streaming_tts_worker and self.streaming_tts_worker.isRunning():
+            self.streaming_tts_worker.stop()
+
+        # 停止普通 TTS 工作线程
         if self.tts_worker and self.tts_worker.isRunning():
             self.tts_worker.stop()
+
+        # 停止 Chat 工作线程
+        if self.chat_worker and self.chat_worker.isRunning():
+            self.chat_worker.stop()
 
         # 立即开始新的录音
         self._start_recording()
@@ -1455,8 +2010,17 @@ class VoiceAssistantWindow(QMainWindow):
 
     def _on_asr_finished(self, final_text: str):
         """语音识别完成"""
+        # 记录语音识别完成时间
+        self.time_asr_end = time.time()
+        self.is_first_chunk = True  # 重置首字标记
+
         self.current_asr_text = final_text
         self.user_text.setText(final_text)
+
+        # 重置耗时显示
+        self.timing_asr_chat.setText("ASR→首字: 计时中...")
+        self.timing_chat_tts.setText("首字→播放: --")
+        self.timing_total.setText("总延时: --")
 
         # 更新按钮状态
         self.mic_button.setText("🎤 点击说话")
@@ -1483,13 +2047,52 @@ class VoiceAssistantWindow(QMainWindow):
         self.chat_worker.start()
 
     def _on_chat_thinking(self):
-        """AI 正在思考"""
+        """AI 正在思考，同时启动流式 TTS"""
         self.status_label.setText("AI 正在思考...")
-        self.ai_text.setText("AI 正在思考...")
+        self.ai_text.setText("")
+        self.current_ai_text = ""
+
+        # 创建并启动流式 TTS 工作线程
+        self.streaming_tts_worker = StreamingTTSWorker(self.signals)
+        self.streaming_tts_worker.start()
+        print("[UI] 流式 TTS 已启动，等待文本片段...")
+
+    def _on_chat_chunk(self, chunk: str):
+        """接收 AI 流式回复片段，传给 TTS 并更新 UI"""
+        if not chunk:
+            return
+
+        # 记录第一个chunk到达时间
+        if self.is_first_chunk:
+            self.time_chat_first = time.time()
+            self.is_first_chunk = False
+            # 计算 ASR→首字 耗时
+            asr_to_chat = (self.time_chat_first - self.time_asr_end) * 1000
+            self.timing_asr_chat.setText(f"ASR→首字: {asr_to_chat:.0f}ms")
+            self.timing_chat_tts.setText("首字→播放: 计时中...")
+            print(f"[计时] ASR→首字: {asr_to_chat:.0f}ms")
+
+        # 累积文本
+        self.current_ai_text += chunk
+        self.ai_text.setText(self.current_ai_text)
+
+        # 传给流式 TTS
+        if self.streaming_tts_worker and self.streaming_tts_worker.is_running:
+            self.streaming_tts_worker.add_text_chunk(chunk)
+
+        # 强制刷新 UI
+        self.ai_text.repaint()
+        QApplication.processEvents()
 
     def _on_chat_reply(self, reply: str):
         """AI 回复完成"""
+        # 确保显示完整文本
         self.ai_text.setText(reply)
+
+        # 通知流式 TTS 文本已结束
+        if self.streaming_tts_worker:
+            self.streaming_tts_worker.finish_text()
+            print("[UI] 流式 TTS 文本已全部发送")
 
         # 更新对话历史
         self.chat_history.append({"role": "user", "content": self.current_asr_text})
@@ -1499,17 +2102,19 @@ class VoiceAssistantWindow(QMainWindow):
         if len(self.chat_history) > 20:
             self.chat_history = self.chat_history[-20:]
 
-        # 调用 TTS
-        self._call_tts(reply)
-
     def _on_chat_error(self, error: str):
         """对话模型错误"""
         self.status_label.setText(f"对话错误: {error}")
         self.ai_text.setText(f"对话失败: {error}")
+
+        # 停止流式 TTS
+        if self.streaming_tts_worker and self.streaming_tts_worker.isRunning():
+            self.streaming_tts_worker.stop()
+
         self._reset_button()
 
     def _call_tts(self, text: str):
-        """调用语音合成"""
+        """调用语音合成（非流式版本，作为备用）"""
         self.status_label.setText("正在合成语音...")
 
         self.tts_worker = TTSWorker(self.signals)
@@ -1518,6 +2123,20 @@ class VoiceAssistantWindow(QMainWindow):
 
     def _on_tts_started(self):
         """TTS 开始播放"""
+        # 记录TTS开始播放时间并计算耗时
+        self.time_tts_play_start = time.time()
+
+        # 计算各阶段耗时
+        if self.time_chat_first > 0:
+            chat_to_tts = (self.time_tts_play_start - self.time_chat_first) * 1000
+            self.timing_chat_tts.setText(f"首字→播放: {chat_to_tts:.0f}ms")
+            print(f"[计时] 首字→播放: {chat_to_tts:.0f}ms")
+
+        if self.time_asr_end > 0:
+            total_delay = (self.time_tts_play_start - self.time_asr_end) * 1000
+            self.timing_total.setText(f"总延时: {total_delay:.0f}ms")
+            print(f"[计时] 总延时: {total_delay:.0f}ms")
+
         self.is_tts_playing = True
         self.status_label.setText("正在播放语音...（点击打断）")
         # 启用按钮，允许打断
@@ -1553,10 +2172,16 @@ class VoiceAssistantWindow(QMainWindow):
             self.asr_worker.wait(1000)
 
         if self.chat_worker and self.chat_worker.isRunning():
+            self.chat_worker.stop()
             self.chat_worker.wait(1000)
 
         if self.tts_worker and self.tts_worker.isRunning():
+            self.tts_worker.stop()
             self.tts_worker.wait(1000)
+
+        if self.streaming_tts_worker and self.streaming_tts_worker.isRunning():
+            self.streaming_tts_worker.stop()
+            self.streaming_tts_worker.wait(1000)
 
         # 清理临时文件
         if os.path.exists(TEMP_AUDIO_PATH):

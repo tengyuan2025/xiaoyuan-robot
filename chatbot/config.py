@@ -40,8 +40,8 @@ AUDIO_CHUNK = 3200  # 200ms/帧 (16000 * 0.2 = 3200 samples)
 
 # 静音检测配置
 SILENCE_THRESHOLD = 1000  # 静音振幅阈值（低于此值视为静音，建议 500-1500）
-SILENCE_TIMEOUT = 3.0  # 静音超时时间（秒），超过此时间自动结束录音
-FINAL_WAIT_TIMEOUT = 3.0  # 发送最后一包后等待最终结果的超时时间（秒）
+SILENCE_TIMEOUT = 1.5  # 静音超时时间（秒），超过此时间自动结束录音
+FINAL_WAIT_TIMEOUT = 1.5  # 发送最后一包后等待最终结果的超时时间（秒）
 
 
 # ==================== Doubao-Seed-1.6 对话模型配置 ====================
@@ -52,9 +52,10 @@ CHAT_API_URL = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
 CHAT_MODEL_NAME = "doubao-seed-1-6-251015"
 
 # 模型参数
-CHAT_MAX_TOKENS = 65535  # 最大生成 tokens 数
-CHAT_TEMPERATURE = 0.7  # 随机性 (0-1)
-CHAT_REASONING_EFFORT = "medium"  # 推理力度: low/medium/high
+CHAT_MAX_TOKENS = 256  # 最大生成 tokens 数（限制长度提速）
+CHAT_TEMPERATURE = 0.2  # 随机性 (0-1)，降低以加速生成
+CHAT_STREAM = True  # 开启流式返回（关键优化项）
+CHAT_THINKING = "disabled"  # 关闭深度思考模式，直接返回结果（提速核心）
 
 
 # ==================== 豆包语音合成配置 ====================
