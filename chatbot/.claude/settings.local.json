@@ -5,7 +5,17 @@
       "Bash(ren \"E:\\\\claude_projects\\\\eve\\\\chatbot\\\\secrets.example.py\" \"api_secrets.example.py\")",
       "Bash(cmd /c \"ren E:\\\\claude_projects\\\\eve\\\\chatbot\\\\secrets.example.py api_secrets.example.py\")",
       "Bash(dir:*)",
-      "Bash(python -m py_compile:*)"
+      "Bash(python -m py_compile:*)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(where:*)",
+      "Bash(C:UserslinanEnvschatbotScriptspip install dlib-bin)",
+      "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\pip.exe\" install dlib-bin)",
+      "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\pip.exe\" install face_recognition --no-deps)",
+      "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\pip.exe\" install face-recognition-models click)",
+      "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\pip.exe\" install Pillow)",
+      "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\python.exe\" -c \"import face_recognition; print\\(''face_recognition OK''\\); import dlib; print\\(f''dlib {dlib.__version__} OK''\\)\")",
+      "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\pip.exe\" install ultralytics)"
     ]
   }
 }

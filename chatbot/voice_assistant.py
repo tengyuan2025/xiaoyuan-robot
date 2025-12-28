@@ -50,6 +50,15 @@ from config import (
     # 对话模型配置
     CHAT_API_KEY, CHAT_API_URL, CHAT_MODEL_NAME,
     CHAT_MAX_TOKENS, CHAT_TEMPERATURE, CHAT_STREAM, CHAT_THINKING,
+    # Base64图文分析配置
+    IMAGE_ANALYSIS_STREAM, IMAGE_ANALYSIS_MAX_TOKENS, IMAGE_ANALYSIS_TEMPERATURE,
+    IMAGE_MAX_WIDTH, IMAGE_MAX_HEIGHT, IMAGE_QUALITY,
+    TEMP_IMAGE_PATH, IMAGE_ANALYSIS_PROMPT_TEMPLATE,
+    # 人脸识别配置
+    FACE_ENCODINGS_PATH, FACE_RECOGNITION_TOLERANCE, FACE_RECOGNITION_MODEL,
+    FACE_RECOGNITION_PROMPT_TEMPLATE,
+    # YOLO 物体检测配置
+    YOLO_MODEL_NAME, YOLO_CONFIDENCE_THRESHOLD, YOLO_USE_CHINESE,
     # 语音合成配置
     TTS_APPID, TTS_ACCESS_TOKEN, TTS_WS_URL, TTS_RESOURCE_ID,
     TTS_SPEAKER, TTS_FORMAT, TTS_SAMPLE_RATE, TTS_SPEECH_RATE, TTS_LOUDNESS_RATE,
@@ -58,6 +67,16 @@ from config import (
     # 网络配置
     REQUEST_TIMEOUT, MAX_RETRIES
 )
+
+# 导入意图判断和摄像头模块
+from intent_handler import IntentHandler, IntentResult, IntentType
+from camera_utils import capture_and_encode, delete_temp_image, image_to_base64
+
+# 导入人脸识别模块
+from face_recognition_utils import FaceRecognitionManager, check_face_recognition_available
+
+# 导入物体检测模块
+from object_detection_utils import ObjectDetector, check_yolo_available
 
 
 # ==================== 信号类（用于线程间通信） ====================
@@ -655,31 +674,46 @@ class ASRWorker(QThread):
         self.recorder.stop()
 
 
-# ==================== 文本对话模块（流式版本） ====================
+# ==================== 文本对话模块（支持Base64图文分析） ====================  # MODIFIED
 class ChatWorker(QThread):
     """
-    文本对话工作线程（流式版本）
+    文本对话工作线程
 
-    负责流式调用 Doubao-Seed-1.6 模型进行对话，实时返回文本片段
+    负责调用 Doubao-Seed-1.6 模型进行对话
+    支持两种模式：
+    1. 纯文本模式：流式调用，实时返回文本片段
+    2. 图文分析模式：非流式调用，通过Base64编码+提示词模板传递图片
     """
 
     def __init__(self, signals: WorkerSignals):
         super().__init__()
         self.signals = signals
         self.user_input = ""
+        self.image_base64: Optional[str] = None  # Base64编码的图片
+        self.image_path: Optional[str] = None    # 临时图片路径（用于清理）
         self.history: List[Dict[str, str]] = []
         self.is_running = True
+        self.use_image_analysis_mode = False     # 强制使用非流式模式
 
-    def set_input(self, text: str, history: List[Dict[str, str]] = None):
+    def set_input(self, text: str, history: List[Dict[str, str]] = None,
+                  image_base64: Optional[str] = None,
+                  image_path: Optional[str] = None,
+                  use_image_analysis_mode: bool = False):
         """
         设置用户输入和对话历史
 
         Args:
             text: 用户输入文本
             history: 对话历史（可选）
+            image_base64: 图片的Base64编码（可选，用于图文分析）
+            image_path: 临时图片路径（可选，用于清理）
+            use_image_analysis_mode: 强制使用非流式图文分析模式（用于提示词中已包含图片的情况）
         """
         self.user_input = text
         self.history = history or []
+        self.image_base64 = image_base64
+        self.image_path = image_path
+        self.use_image_analysis_mode = use_image_analysis_mode
 
     def stop(self):
         """停止对话"""
@@ -696,17 +730,124 @@ class ChatWorker(QThread):
         # 发送"正在思考"信号
         self.signals.chat_thinking.emit()
 
-        # 流式调用对话模型
-        full_reply = self._call_chat_api_stream()
+        # 判断是否为图文分析模式
+        if self.image_base64 or self.use_image_analysis_mode:
+            # 图文分析模式：非流式调用
+            full_reply = self._call_chat_api_with_image()
+        else:
+            # 纯文本模式：流式调用
+            full_reply = self._call_chat_api_stream()
 
         if full_reply:
             self.signals.chat_reply.emit(full_reply)
-        elif self.is_running:  # 只有在非中断情况下才报错
+        elif self.is_running:
             self.signals.chat_error.emit("对话模型调用失败")
+
+        # 清理临时图片  # MODIFIED
+        if self.image_path:
+            delete_temp_image(self.image_path)
+            self.image_path = None
+
+    def _build_image_analysis_prompt(self, user_question: str, image_base64: str) -> str:  # NEW
+        """
+        构建图文分析提示词
+
+        使用配置的模板，将用户问题和Base64图片编码嵌入其中
+
+        Args:
+            user_question: 用户的问题
+            image_base64: 图片的Base64编码（带格式头）
+
+        Returns:
+            完整的提示词
+        """
+        return IMAGE_ANALYSIS_PROMPT_TEMPLATE.format(
+            user_question=user_question,
+            image_base64=image_base64
+        )
+
+    def _call_chat_api_with_image(self) -> Optional[str]:  # NEW
+        """
+        图文分析模式：非流式调用 Doubao-Seed-1.6
+
+        通过Base64编码+提示词模板传递图片
+
+        Returns:
+            str: AI 完整回复文本，失败返回 None
+        """
+        headers = {
+            "Authorization": f"Bearer {CHAT_API_KEY}",
+            "Content-Type": "application/json"
+        }
+
+        # 构建提示词
+        if self.image_base64:
+            # 标准图文分析模式：使用模板构建提示词
+            prompt = self._build_image_analysis_prompt(self.user_input, self.image_base64)
+        else:
+            # 自定义提示词模式：提示词中已包含图片（如人脸识别场景）
+            prompt = self.user_input
+        print(f"[Chat] 图文分析模式，提示词长度: {len(prompt)} 字符")
+
+        # 图文分析不使用历史记录（避免上下文过长）
+        messages = [{"role": "user", "content": prompt}]
+
+        data = {
+            "model": CHAT_MODEL_NAME,
+            "messages": messages,
+            "max_completion_tokens": IMAGE_ANALYSIS_MAX_TOKENS,
+            "temperature": IMAGE_ANALYSIS_TEMPERATURE,
+            "stream": IMAGE_ANALYSIS_STREAM  # 非流式调用
+        }
+
+        print(f"[Chat] 发送图文分析请求: model={CHAT_MODEL_NAME}, stream={IMAGE_ANALYSIS_STREAM}")
+
+        try:
+            response = requests.post(
+                CHAT_API_URL,
+                headers=headers,
+                data=json.dumps(data),
+                timeout=REQUEST_TIMEOUT * 2  # 图文分析超时时间加倍
+            )
+            response.raise_for_status()
+
+            res = response.json()
+
+            # 检查错误
+            if res.get("error"):
+                error_msg = res.get("error", {}).get("message", "未知错误")
+                print(f"[Chat] 图文分析错误: {error_msg}")
+                return None
+
+            # 提取回复文本
+            choices = res.get("choices", [])
+            if choices:
+                message = choices[0].get("message", {})
+                content = message.get("content", "")
+                if content:
+                    print(f"[Chat] 图文分析完成，回复长度: {len(content)}")
+                    # 非流式模式，一次性发送完整回复
+                    self.signals.chat_chunk.emit(content)
+                    return content
+
+            print("[Chat] 图文分析返回为空")
+            return None
+
+        except requests.exceptions.Timeout:
+            print("[Chat] 图文分析请求超时")
+            return None
+        except requests.exceptions.RequestException as e:
+            print(f"[Chat] 图文分析请求异常: {e}")
+            return None
+        except Exception as e:
+            print(f"[Chat] 图文分析处理异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
     def _call_chat_api_stream(self) -> Optional[str]:
         """
-        流式调用 Doubao-Seed-1.6 对话 API
+        纯文本模式：流式调用 Doubao-Seed-1.6
 
         Returns:
             str: AI 完整回复文本，失败返回 None
@@ -719,12 +860,13 @@ class ChatWorker(QThread):
         # 构造请求体（精简历史，只保留最近2轮对话）
         recent_history = self.history[-4:] if len(self.history) > 4 else self.history
         messages = recent_history + [{"role": "user", "content": self.user_input}]
+
         data = {
             "model": CHAT_MODEL_NAME,
             "messages": messages,
             "max_completion_tokens": CHAT_MAX_TOKENS,
             "temperature": CHAT_TEMPERATURE,
-            "stream": CHAT_STREAM  # 开启流式返回
+            "stream": CHAT_STREAM
         }
 
         # 如果配置了 thinking 参数，添加到请求中
@@ -1671,6 +1813,27 @@ class VoiceAssistantWindow(QMainWindow):
         self.tts_worker: Optional[TTSWorker] = None
         self.streaming_tts_worker: Optional[StreamingTTSWorker] = None  # 流式 TTS
 
+        # 初始化人脸识别管理器
+        self.face_recognition_manager = FaceRecognitionManager(
+            encodings_path=FACE_ENCODINGS_PATH,
+            tolerance=FACE_RECOGNITION_TOLERANCE,
+            model=FACE_RECOGNITION_MODEL
+        )
+
+        # 初始化物体检测器
+        self.object_detector = ObjectDetector(
+            model_name=YOLO_MODEL_NAME,
+            confidence_threshold=YOLO_CONFIDENCE_THRESHOLD,
+            use_chinese=YOLO_USE_CHINESE
+        )
+
+        # 初始化意图处理器
+        self.intent_handler = IntentHandler(
+            camera_callback=self._capture_image_callback,
+            face_recognition_manager=self.face_recognition_manager,
+            object_detector=self.object_detector
+        )
+
         # 对话历史
         self.chat_history: List[Dict[str, str]] = []
 
@@ -1679,6 +1842,12 @@ class VoiceAssistantWindow(QMainWindow):
         self.is_tts_playing = False  # TTS 是否正在播放
         self.current_asr_text = ""
         self.current_ai_text = ""  # AI 回复文本（流式累积）
+        self.current_image_path: Optional[str] = None   # 当前拍摄的图片路径
+        self.current_image_base64: Optional[str] = None # 当前图片的Base64编码
+
+        # 人脸注册状态（追问模式）
+        self.waiting_for_face_name = False              # 是否在等待用户说人名
+        self.pending_face_encoding = None               # 待注册的人脸编码
 
         # 计时统计（用于性能分析）
         self.time_asr_end = 0.0          # 语音识别完成时间
@@ -1957,6 +2126,38 @@ class VoiceAssistantWindow(QMainWindow):
         # 立即开始新的录音
         self._start_recording()
 
+    def _capture_image_callback(self) -> Optional[str]:  # NEW
+        """
+        摄像头拍照回调函数
+
+        使用配置的参数调用摄像头拍照，并返回图片路径
+        同时将图片转换为Base64编码存储
+
+        Returns:
+            图片路径，失败返回None
+        """
+        print("[UI] 正在调用摄像头拍照...")
+
+        # 使用配置的参数拍照并编码
+        image_path, image_base64 = capture_and_encode(
+            save_path=TEMP_IMAGE_PATH,
+            max_width=IMAGE_MAX_WIDTH,
+            max_height=IMAGE_MAX_HEIGHT,
+            quality=IMAGE_QUALITY
+        )
+
+        if image_path and image_base64:
+            # 保存Base64编码供后续使用
+            self.current_image_base64 = image_base64
+            self.current_image_path = image_path
+            print(f"[UI] 拍照并编码成功，Base64长度: {len(image_base64)}")
+            return image_path
+        else:
+            self.current_image_base64 = None
+            self.current_image_path = None
+            print("[UI] 拍照或编码失败")
+            return None
+
     def _start_recording(self):
         """开始录音"""
         self.is_recording = True
@@ -2028,8 +2229,33 @@ class VoiceAssistantWindow(QMainWindow):
         self.mic_button.setEnabled(False)
 
         if final_text.strip():
-            # 调用对话模型
-            self._call_chat(final_text)
+            # ========== 检查是否在等待人名（人脸注册追问模式） ==========
+            if self.waiting_for_face_name and self.pending_face_encoding is not None:
+                self._complete_face_registration(final_text)
+                return
+
+            # ========== 意图判断 ==========
+            self.status_label.setText("正在分析意图...")
+            QApplication.processEvents()
+
+            intent_result = self.intent_handler.process(final_text)
+            print(f"[UI] 意图判断结果: {intent_result.intent_type.value}")
+
+            # 处理意图结果
+            if intent_result.intent_type == IntentType.FACE_REGISTER:
+                # 人脸注册意图
+                self._handle_face_register_result(intent_result, final_text)
+            elif intent_result.intent_type == IntentType.FACE_RECOGNIZE:
+                # 人脸识别意图
+                self._handle_face_recognize_result(intent_result, final_text)
+            elif intent_result.intent_type == IntentType.LOOK:
+                # 看相关意图 - 本地识别模式（人脸 + YOLO）
+                self._handle_look_result(intent_result, final_text)
+            else:
+                # 默认意图（纯文本）
+                self.current_image_path = None
+                self.current_image_base64 = None
+                self._call_chat(final_text)
         else:
             self.status_label.setText("未识别到有效语音，请重试")
             self._reset_button()
@@ -2040,10 +2266,298 @@ class VoiceAssistantWindow(QMainWindow):
         self.ai_text.setText(f"语音识别失败: {error}")
         self._reset_button()
 
-    def _call_chat(self, user_input: str):
-        """调用对话模型"""
+    def _handle_face_register_result(self, intent_result: IntentResult, original_text: str):
+        """
+        处理人脸注册意图结果
+
+        Args:
+            intent_result: 意图判断结果
+            original_text: 用户原始输入
+        """
+        if intent_result.error_message:
+            # 拍照或人脸检测失败
+            self.status_label.setText(intent_result.error_message)
+            self.ai_text.setText(intent_result.error_message)
+            print(f"[UI] 人脸注册失败: {intent_result.error_message}")
+            self._speak_text(intent_result.error_message)
+            return
+
+        if intent_result.pending_face_encoding is not None:
+            # 成功检测到人脸，进入追问模式
+            self.pending_face_encoding = intent_result.pending_face_encoding
+            self.waiting_for_face_name = True
+
+            ask_name_text = "好的，请问这位叫什么名字？"
+            self.status_label.setText("等待用户说人名...")
+            self.ai_text.setText(ask_name_text)
+            print(f"[UI] 人脸编码已保存，等待用户提供人名")
+
+            # 语音追问
+            self._speak_text(ask_name_text)
+        else:
+            # 未检测到人脸
+            error_msg = "未检测到人脸，请确保脸部清晰可见"
+            self.status_label.setText(error_msg)
+            self.ai_text.setText(error_msg)
+            self._speak_text(error_msg)
+
+    def _complete_face_registration(self, name_text: str):
+        """
+        完成人脸注册（用户说出人名后）
+
+        Args:
+            name_text: 用户说的人名
+        """
+        # 清理人名（去除标点符号）
+        import re
+        name = re.sub(r'[，。！？、；：""''（）【】\s]', '', name_text).strip()
+
+        if not name:
+            error_msg = "没有听清名字，请再说一次"
+            self.status_label.setText(error_msg)
+            self.ai_text.setText(error_msg)
+            self._speak_text(error_msg)
+            return
+
+        # 注册人脸
+        success, message = self.face_recognition_manager.register_face_with_encoding(
+            encoding=self.pending_face_encoding,
+            name=name
+        )
+
+        # 重置状态
+        self.waiting_for_face_name = False
+        self.pending_face_encoding = None
+
+        if success:
+            result_msg = f"好的，我已经记住{name}了"
+            self.status_label.setText(f"已注册: {name}")
+            print(f"[UI] 人脸注册成功: {name}")
+        else:
+            result_msg = f"注册失败：{message}"
+            self.status_label.setText(result_msg)
+            print(f"[UI] 人脸注册失败: {message}")
+
+        self.ai_text.setText(result_msg)
+        self._speak_text(result_msg)
+
+    def _handle_look_result(self, intent_result: IntentResult, original_text: str):
+        """
+        处理看相关意图结果（本地识别模式：人脸 + YOLO）
+
+        Args:
+            intent_result: 意图判断结果
+            original_text: 用户原始输入
+        """
+        if intent_result.error_message:
+            self.status_label.setText(intent_result.error_message)
+            self.ai_text.setText(intent_result.error_message)
+            print(f"[UI] 本地识别失败: {intent_result.error_message}")
+            self._speak_text(intent_result.error_message)
+            return
+
+        # 构建识别结果描述
+        descriptions = []
+        unknown_count = 0
+        recognized_names = []
+
+        # 人脸识别结果
+        if intent_result.face_results:
+            for face in intent_result.face_results:
+                if face.get("name") == "unknown":
+                    unknown_count += 1
+                else:
+                    recognized_names.append(face.get("name", ""))
+
+            if recognized_names:
+                descriptions.append(f"人物：{', '.join(recognized_names)}")
+
+        # 物体检测结果（排除"人"类别，因为已经通过人脸识别处理了）
+        if intent_result.object_results:
+            object_counts = {}
+            for obj in intent_result.object_results:
+                name = obj.get("class_name", "")
+                if name and name != "人":  # 排除人，避免重复
+                    object_counts[name] = object_counts.get(name, 0) + 1
+
+            object_descs = []
+            for name, count in object_counts.items():
+                if count == 1:
+                    object_descs.append(name)
+                else:
+                    object_descs.append(f"{count}个{name}")
+
+            if object_descs:
+                descriptions.append(f"物体：{', '.join(object_descs)}")
+
+        # 生成回复
+        if descriptions:
+            result_text = f"我看到了：{'; '.join(descriptions)}"
+        else:
+            result_text = ""
+
+        # 如果有未知人脸，追问并进入注册流程
+        if unknown_count > 0:
+            # 提取人脸编码用于后续注册
+            if intent_result.image_path and self.face_recognition_manager:
+                encoding = self.face_recognition_manager.encode_face(intent_result.image_path)
+                if encoding is not None:
+                    self.pending_face_encoding = encoding
+                    self.waiting_for_face_name = True
+
+                    if unknown_count == 1:
+                        ask_text = "我看到一个人，但我不认识。请问他是谁？"
+                    else:
+                        ask_text = f"我看到{unknown_count}个人，但我都不认识。请问他们是谁？"
+
+                    if result_text:
+                        result_text = f"{result_text}。{ask_text}"
+                    else:
+                        result_text = ask_text
+
+                    print(f"[UI] 检测到未知人脸，进入注册追问模式")
+                    self.status_label.setText("等待用户说人名...")
+            else:
+                # 无法提取编码，只报告结果
+                if unknown_count == 1:
+                    descriptions.insert(0, "1个未知人脸")
+                else:
+                    descriptions.insert(0, f"{unknown_count}个未知人脸")
+                result_text = f"我看到了：{'; '.join(descriptions)}"
+        elif not result_text:
+            result_text = "没有识别到明显的人脸或物体"
+
+        print(f"[UI] 本地识别结果: {result_text}")
+        self.ai_text.setText(result_text)
+
+        # 清理临时图片（如果不需要等待注册）
+        if intent_result.image_path and not self.waiting_for_face_name:
+            delete_temp_image(intent_result.image_path)
+
+        # 语音播报
+        self._speak_text(result_text)
+
+    def _handle_face_recognize_result(self, intent_result: IntentResult, original_text: str):
+        """
+        处理人脸识别意图结果
+
+        Args:
+            intent_result: 意图判断结果
+            original_text: 用户原始输入
+        """
+        if intent_result.error_message:
+            # 拍照或人脸检测失败
+            self.status_label.setText(intent_result.error_message)
+            self.ai_text.setText(intent_result.error_message)
+            print(f"[UI] 人脸识别失败: {intent_result.error_message}")
+            self._speak_text(intent_result.error_message)
+            return
+
+        if not intent_result.face_results:
+            # 没有已注册的人脸数据
+            no_data_msg = "我还没有记住任何人，需要先让我记住一些人"
+            self.status_label.setText(no_data_msg)
+            self.ai_text.setText(no_data_msg)
+            self._speak_text(no_data_msg)
+            return
+
+        # 构建识别结果描述
+        recognized_names = []
+        unknown_count = 0
+        for face in intent_result.face_results:
+            if face["name"] == "unknown":
+                unknown_count += 1
+            else:
+                recognized_names.append(face["name"])
+
+        # 构建人脸信息描述（用于提示词）
+        if recognized_names:
+            if unknown_count > 0:
+                face_info = f"照片中我认出了{', '.join(recognized_names)}，还有{unknown_count}个我不认识的人"
+            else:
+                face_info = f"照片中是{', '.join(recognized_names)}"
+        else:
+            face_info = f"照片中有{unknown_count}个人，但我都不认识"
+
+        print(f"[UI] 人脸识别结果: {face_info}")
+
+        # 获取图片 Base64 编码
+        if intent_result.image_path:
+            image_base64 = image_to_base64(intent_result.image_path)
+            self.current_image_path = intent_result.image_path
+            self.current_image_base64 = image_base64
+        else:
+            image_base64 = None
+
+        # 结合对话模型分析
+        if image_base64:
+            self.status_label.setText("正在分析...")
+            # 使用人脸识别专用提示词模板
+            enhanced_prompt = FACE_RECOGNITION_PROMPT_TEMPLATE.format(
+                face_info=face_info,
+                user_question=original_text,
+                image_base64=image_base64
+            )
+            # 调用对话模型
+            self._call_chat_with_custom_prompt(enhanced_prompt, image_path=intent_result.image_path)
+        else:
+            # 无图片，直接回复识别结果
+            self.status_label.setText("识别完成")
+            self.ai_text.setText(face_info)
+            self._speak_text(face_info)
+
+    def _call_chat_with_custom_prompt(self, prompt: str, image_path: Optional[str] = None):
+        """
+        使用自定义提示词调用对话模型
+
+        Args:
+            prompt: 完整的提示词（已包含图片Base64）
+            image_path: 临时图片路径（用于清理）
+        """
         self.chat_worker = ChatWorker(self.signals)
-        self.chat_worker.set_input(user_input, self.chat_history)
+        self.chat_worker.set_input(
+            prompt,
+            [],  # 不使用历史对话
+            image_base64=None,  # 提示词中已包含图片
+            image_path=image_path,
+            use_image_analysis_mode=True  # 使用非流式模式
+        )
+        self.chat_worker.start()
+
+    def _speak_text(self, text: str):
+        """
+        语音播报文本
+
+        Args:
+            text: 要播报的文本
+        """
+        # 启动流式 TTS（单次播报）
+        self.streaming_tts_worker = StreamingTTSWorker(self.signals)
+        self.streaming_tts_worker.start()
+        # 发送文本并结束
+        self.signals.chat_chunk.emit(text)
+        self.signals.chat_reply.emit(text)
+        # 重置按钮
+        self._reset_button()
+
+    def _call_chat(self, user_input: str,
+                   image_base64: Optional[str] = None,
+                   image_path: Optional[str] = None):  # MODIFIED
+        """
+        调用对话模型
+
+        Args:
+            user_input: 用户输入文本
+            image_base64: 图片的Base64编码（可选，用于图文分析）
+            image_path: 临时图片路径（可选，用于清理）
+        """
+        self.chat_worker = ChatWorker(self.signals)
+        self.chat_worker.set_input(
+            user_input,
+            self.chat_history,
+            image_base64=image_base64,
+            image_path=image_path
+        )
         self.chat_worker.start()
 
     def _on_chat_thinking(self):
@@ -2183,12 +2697,18 @@ class VoiceAssistantWindow(QMainWindow):
             self.streaming_tts_worker.stop()
             self.streaming_tts_worker.wait(1000)
 
-        # 清理临时文件
+        # 清理临时音频文件
         if os.path.exists(TEMP_AUDIO_PATH):
             try:
                 os.remove(TEMP_AUDIO_PATH)
             except:
                 pass
+
+        # 清理临时图片文件  # MODIFIED
+        if self.current_image_path:
+            delete_temp_image(self.current_image_path)
+            self.current_image_path = None
+        self.current_image_base64 = None  # 清理Base64数据
 
         event.accept()
 

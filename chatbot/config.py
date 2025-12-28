@@ -58,6 +58,80 @@ CHAT_STREAM = True  # 开启流式返回（关键优化项）
 CHAT_THINKING = "disabled"  # 关闭深度思考模式，直接返回结果（提速核心）
 
 
+# ==================== Base64图文分析配置 ====================
+# 图文分析使用同一个模型（Doubao-Seed-1.6），通过Base64编码+提示词实现
+# 图文分析时使用非流式调用（需要完整上下文，流式会降低精度）
+IMAGE_ANALYSIS_STREAM = False
+
+# 图文分析模型参数（比普通对话需要更多tokens）
+IMAGE_ANALYSIS_MAX_TOKENS = 1024
+IMAGE_ANALYSIS_TEMPERATURE = 0.2
+
+# 图片压缩配置（避免Base64过长导致超时）
+IMAGE_MAX_WIDTH = 1920   # 最大宽度
+IMAGE_MAX_HEIGHT = 1080  # 最大高度
+IMAGE_QUALITY = 85       # JPEG压缩质量 (1-100)
+
+# 临时图片保存路径
+TEMP_IMAGE_PATH = os.path.join(os.path.dirname(__file__), "temp_capture.jpg")
+
+# Base64图文分析提示词模板
+IMAGE_ANALYSIS_PROMPT_TEMPLATE = """请严格按照以下步骤执行：
+1. 解码我提供的Base64字符串（格式为data:image/jpeg;base64,xxx），还原为JPEG图片；
+2. 分析图片内容（物体、场景、颜色等关键信息）；
+3. 结合我的问题「{user_question}」，给出简洁清晰的回答；
+4. 仅回复最终答案，不要提及Base64、解码等过程性内容。
+
+图片Base64编码：
+{image_base64}"""
+
+
+# ==================== 人脸识别配置 ====================
+# 人脸编码存储路径
+FACE_ENCODINGS_PATH = os.path.join(os.path.dirname(__file__), "faces", "encodings.json")
+
+# 人脸匹配容差（越小越严格，建议0.4-0.6）
+# 0.6: 默认值，适合一般场景
+# 0.5: 更严格，减少误识别
+# 0.4: 非常严格，可能增加漏识别
+FACE_RECOGNITION_TOLERANCE = 0.6
+
+# 人脸检测模型
+# "hog": 快速，CPU友好，适合实时检测
+# "cnn": 更准确，需要GPU支持，速度较慢
+FACE_RECOGNITION_MODEL = "hog"
+
+# 人脸识别结果融合到对话的提示词模板
+# {face_names}: 识别到的人名列表
+# {user_question}: 用户原始问题
+# {image_base64}: 图片Base64编码
+FACE_RECOGNITION_PROMPT_TEMPLATE = """我拍摄了一张照片，{face_info}。
+
+请根据照片内容回答用户的问题：「{user_question}」
+
+要求：
+1. 回答要简洁清晰
+2. 如果识别出了人名，在回答中自然地提到
+3. 不要提及Base64或技术细节
+
+图片Base64编码：
+{image_base64}"""
+
+
+# ==================== YOLO 物体检测配置 ====================
+# YOLO 模型选择
+# yolov8n.pt: 最快，精度较低（推荐，首次运行自动下载约 6MB）
+# yolov8s.pt: 快速，精度适中（约 22MB）
+# yolov8m.pt: 中等速度，精度较高（约 52MB）
+YOLO_MODEL_NAME = "yolov8n.pt"
+
+# 检测置信度阈值（越高越严格）
+YOLO_CONFIDENCE_THRESHOLD = 0.5
+
+# 是否使用中文类别名称
+YOLO_USE_CHINESE = True
+
+
 # ==================== 豆包语音合成配置 ====================
 # 语音合成 WebSocket 接口地址（双向流式接口）
 TTS_WS_URL = "wss://openspeech.bytedance.com/api/v3/tts/bidirection"

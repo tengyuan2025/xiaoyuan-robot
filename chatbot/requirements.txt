@@ -13,5 +13,19 @@ websockets>=11.0.3
 pyaudio>=0.2.13
 pygame>=2.5.2
 
+# ==================== 计算机视觉 ====================
+opencv-python>=4.8.0  # 摄像头拍照功能
+
+# ==================== 人脸识别 ====================
+# 注意: face_recognition 依赖 dlib，Windows 安装可能需要：
+# 1. 安装 Visual Studio Build Tools
+# 2. 或使用预编译包: pip install dlib-bin
+face_recognition>=1.3.0
+numpy>=1.24.0
+
+# ==================== 物体检测 ====================
+# YOLOv8 物体检测（首次运行会自动下载模型）
+ultralytics>=8.0.0
+
 # ==================== 可选依赖 ====================
 # python-dotenv>=1.0.0  # 如需从 .env 文件加载环境变量
