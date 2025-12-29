@@ -118,6 +118,20 @@ FACE_RECOGNITION_PROMPT_TEMPLATE = """我拍摄了一张照片，{face_info}。
 {image_base64}"""
 
 
+# ==================== 声纹识别配置 ====================
+# 声纹数据存储路径
+VOICEPRINT_DATA_PATH = os.path.join(os.path.dirname(__file__), "voiceprints.json")
+
+# 声纹匹配相似度阈值（余弦相似度，0-1，越高越严格）
+# 0.80: 非常严格，可能漏识别
+# 0.75: 推荐值，平衡准确率和召回率
+# 0.70: 较宽松，可能误识别
+SPEAKER_SIMILARITY_THRESHOLD = 0.75
+
+# 最小有效音频时长（秒），低于此时长不提取声纹
+SPEAKER_MIN_AUDIO_DURATION = 1.0
+
+
 # ==================== YOLO 物体检测配置 ====================
 # YOLO 模型选择
 # yolov8n.pt: 最快，精度较低（推荐，首次运行自动下载约 6MB）

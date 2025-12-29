@@ -15,7 +15,14 @@
       "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\pip.exe\" install face-recognition-models click)",
       "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\pip.exe\" install Pillow)",
       "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\python.exe\" -c \"import face_recognition; print\\(''face_recognition OK''\\); import dlib; print\\(f''dlib {dlib.__version__} OK''\\)\")",
-      "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\pip.exe\" install ultralytics)"
+      "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\pip.exe\" install ultralytics)",
+      "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\pip.exe\" install resemblyzer)",
+      "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\python.exe\" -m py_compile E:claude_projectsevexiaoyuan-robotchatbotspeaker_recognition_utils.py)",
+      "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\python.exe\" -m py_compile E:claude_projectsevexiaoyuan-robotchatbotvoice_assistant.py)",
+      "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\python.exe\" -m py_compile E:claude_projectsevexiaoyuan-robotchatbotconfig.py)",
+      "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\python.exe\" -m py_compile \"E:\\\\claude_projects\\\\eve\\\\xiaoyuan-robot\\\\chatbot\\\\speaker_recognition_utils.py\")",
+      "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\python.exe\" -m py_compile \"E:\\\\claude_projects\\\\eve\\\\xiaoyuan-robot\\\\chatbot\\\\voice_assistant.py\")",
+      "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\python.exe\" -m py_compile \"E:\\\\claude_projects\\\\eve\\\\xiaoyuan-robot\\\\chatbot\\\\config.py\")"
     ]
   }
 }

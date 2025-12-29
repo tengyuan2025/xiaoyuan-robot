@@ -59,6 +59,8 @@ from config import (
     FACE_RECOGNITION_PROMPT_TEMPLATE,
     # YOLO 物体检测配置
     YOLO_MODEL_NAME, YOLO_CONFIDENCE_THRESHOLD, YOLO_USE_CHINESE,
+    # 声纹识别配置
+    VOICEPRINT_DATA_PATH, SPEAKER_SIMILARITY_THRESHOLD, SPEAKER_MIN_AUDIO_DURATION,
     # 语音合成配置
     TTS_APPID, TTS_ACCESS_TOKEN, TTS_WS_URL, TTS_RESOURCE_ID,
     TTS_SPEAKER, TTS_FORMAT, TTS_SAMPLE_RATE, TTS_SPEECH_RATE, TTS_LOUDNESS_RATE,
@@ -78,6 +80,9 @@ from face_recognition_utils import FaceRecognitionManager, check_face_recognitio
 # 导入物体检测模块
 from object_detection_utils import ObjectDetector, check_yolo_available
 
+# 导入声纹识别模块
+from speaker_recognition_utils import SpeakerRecognitionManager, check_resemblyzer_available
+
 
 # ==================== 信号类（用于线程间通信） ====================
 class WorkerSignals(QObject):
@@ -86,6 +91,7 @@ class WorkerSignals(QObject):
     # 语音识别相关信号
     asr_text_update = pyqtSignal(str)       # 实时识别文本更新
     asr_finished = pyqtSignal(str)          # 识别完成，传递最终文本
+    asr_audio_data = pyqtSignal(bytes)      # 原始音频数据（用于声纹识别）
     asr_error = pyqtSignal(str)             # 识别错误
 
     # 对话模型相关信号
@@ -231,11 +237,13 @@ class ASRWorker(QThread):
         self.recorder = AudioRecorder()
         self.is_running = False
         self.final_text = ""
+        self.audio_chunks: List[bytes] = []  # 缓存原始音频用于声纹识别
 
     def run(self):
         """线程主函数"""
         self.is_running = True
         self.final_text = ""
+        self.audio_chunks = []  # 清空音频缓存
         self.ws_ready = False  # WebSocket 连接是否就绪
 
         # 先启动录音，不等待连接
@@ -483,6 +491,12 @@ class ASRWorker(QThread):
         except Exception as e:
             self.signals.asr_error.emit(f"语音识别连接失败: {str(e)}")
         finally:
+            # 发送原始音频数据信号（用于声纹识别）
+            if self.audio_chunks:
+                all_audio = b''.join(self.audio_chunks)
+                self.signals.asr_audio_data.emit(all_audio)
+                print(f"[ASR] 发送音频数据用于声纹识别: {len(all_audio)} 字节")
+
             # 发送识别完成信号
             self.signals.asr_finished.emit(self.final_text)
 
@@ -508,6 +522,7 @@ class ASRWorker(QThread):
             if buffered_frames:
                 print(f"[ASR] 发送缓冲区中的 {len(buffered_frames)} 帧音频")
                 for audio_data in buffered_frames:
+                    self.audio_chunks.append(audio_data)  # 缓存音频用于声纹识别
                     audio_packet = self._build_audio_request(audio_data, is_last=False, use_gzip=False)
                     await websocket.send(audio_packet)
                     frame_count += 1
@@ -524,6 +539,8 @@ class ASRWorker(QThread):
             while self.is_running:
                 audio_data = self.recorder.read_chunk()
                 if audio_data:
+                    self.audio_chunks.append(audio_data)  # 缓存音频用于声纹识别
+
                     # 计算音频振幅（检测是否有有效声音）
                     samples = array.array('h', audio_data)
                     frame_max = max(abs(s) for s in samples) if samples else 0
@@ -1827,6 +1844,13 @@ class VoiceAssistantWindow(QMainWindow):
             use_chinese=YOLO_USE_CHINESE
         )
 
+        # 初始化声纹识别管理器
+        self.speaker_recognition_manager = SpeakerRecognitionManager(
+            data_path=VOICEPRINT_DATA_PATH,
+            similarity_threshold=SPEAKER_SIMILARITY_THRESHOLD,
+            min_audio_duration=SPEAKER_MIN_AUDIO_DURATION
+        )
+
         # 初始化意图处理器
         self.intent_handler = IntentHandler(
             camera_callback=self._capture_image_callback,
@@ -1848,6 +1872,11 @@ class VoiceAssistantWindow(QMainWindow):
         # 人脸注册状态（追问模式）
         self.waiting_for_face_name = False              # 是否在等待用户说人名
         self.pending_face_encoding = None               # 待注册的人脸编码
+
+        # 声纹识别状态
+        self.current_speaker_name: Optional[str] = None  # 当前识别的说话人
+        self.pending_speaker_embedding = None            # 待注册的声纹嵌入向量
+        self.waiting_for_speaker_name = False            # 是否在等待用户说名字
 
         # 计时统计（用于性能分析）
         self.time_asr_end = 0.0          # 语音识别完成时间
@@ -2069,6 +2098,7 @@ class VoiceAssistantWindow(QMainWindow):
         # 语音识别信号
         self.signals.asr_text_update.connect(self._on_asr_text_update)
         self.signals.asr_finished.connect(self._on_asr_finished)
+        self.signals.asr_audio_data.connect(self._on_asr_audio_data)  # 声纹识别
         self.signals.asr_error.connect(self._on_asr_error)
 
         # 录音状态信号
@@ -2209,6 +2239,78 @@ class VoiceAssistantWindow(QMainWindow):
             self.status_label.repaint()
             QApplication.processEvents()
 
+    def _on_asr_audio_data(self, audio_bytes: bytes):
+        """
+        处理原始音频数据，提取声纹并匹配
+
+        Args:
+            audio_bytes: 原始PCM音频数据
+        """
+        print(f"[声纹识别] 收到音频数据: {len(audio_bytes)} 字节")
+
+        # 如果正在等待用户说名字，不进行声纹匹配（避免覆盖状态）
+        if self.waiting_for_speaker_name:
+            print("[声纹识别] 正在等待用户说名字，跳过声纹匹配")
+            return
+
+        # 提取声纹嵌入向量
+        embedding = self.speaker_recognition_manager.extract_embedding(
+            audio_bytes, sample_rate=AUDIO_RATE
+        )
+
+        if embedding is None:
+            print("[声纹识别] 提取声纹失败（音频太短或无效）")
+            self.current_speaker_name = None
+            self.pending_speaker_embedding = None
+            return
+
+        # 匹配说话人
+        name, similarity = self.speaker_recognition_manager.match_speaker(embedding)
+
+        if name:
+            # 识别到已知说话人
+            self.current_speaker_name = name
+            self.pending_speaker_embedding = None
+            print(f"[声纹识别] 识别到说话人: {name} (相似度: {similarity:.3f})")
+        else:
+            # 未知说话人，暂存声纹待注册
+            self.current_speaker_name = None
+            self.pending_speaker_embedding = embedding
+            print(f"[声纹识别] 未知说话人，暂存声纹待注册 (最高相似度: {similarity:.3f})")
+
+    def _extract_name_from_text(self, text: str) -> Optional[str]:
+        """
+        从文本中提取名字
+
+        Args:
+            text: 用户说的文本
+
+        Returns:
+            提取的名字，失败返回None
+        """
+        text = text.strip()
+        if not text:
+            return None
+
+        # 去掉常见前缀
+        prefixes = ["我叫", "我是", "叫我", "我的名字是", "你可以叫我", "我叫做", "我名叫"]
+        for prefix in prefixes:
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+                break
+
+        # 去掉语气词后缀
+        suffixes = ["吧", "呀", "啊", "哦", "呢", "嘛", "哈", "了"]
+        for suffix in suffixes:
+            if text.endswith(suffix):
+                text = text[:-len(suffix)].strip()
+
+        # 去掉标点符号
+        import re
+        text = re.sub(r'[，。！？,.!?]', '', text).strip()
+
+        return text if text else None
+
     def _on_asr_finished(self, final_text: str):
         """语音识别完成"""
         # 记录语音识别完成时间
@@ -2232,6 +2334,11 @@ class VoiceAssistantWindow(QMainWindow):
             # ========== 检查是否在等待人名（人脸注册追问模式） ==========
             if self.waiting_for_face_name and self.pending_face_encoding is not None:
                 self._complete_face_registration(final_text)
+                return
+
+            # ========== 检查是否在等待说话人名字（声纹注册追问模式） ==========
+            if self.waiting_for_speaker_name and self.pending_speaker_embedding is not None:
+                self._complete_speaker_registration(final_text)
                 return
 
             # ========== 意图判断 ==========
@@ -2625,6 +2732,9 @@ class VoiceAssistantWindow(QMainWindow):
         if self.streaming_tts_worker and self.streaming_tts_worker.isRunning():
             self.streaming_tts_worker.stop()
 
+        # 清空待注册的声纹，避免 Chat 失败后仍追问名字
+        self.pending_speaker_embedding = None
+
         self._reset_button()
 
     def _call_tts(self, text: str):
@@ -2661,6 +2771,15 @@ class VoiceAssistantWindow(QMainWindow):
     def _on_tts_finished(self):
         """TTS 播放完成"""
         self.is_tts_playing = False
+
+        # 检查是否需要追问说话人名字（有待注册的声纹）
+        if self.pending_speaker_embedding is not None and not self.waiting_for_speaker_name:
+            self.waiting_for_speaker_name = True
+            self.status_label.setText("询问说话人名字...")
+            # 播报追问语音
+            self._speak_text("对了，我还不知道你的名字，请问怎么称呼你？")
+            return
+
         self.status_label.setText("对话完成，点击麦克风继续")
         self._reset_button()
 
@@ -2677,6 +2796,36 @@ class VoiceAssistantWindow(QMainWindow):
         self.mic_button.setText("🎤 点击说话")
         self._set_button_style_normal()
         self.mic_button.setEnabled(True)
+
+    def _complete_speaker_registration(self, text: str):
+        """
+        完成声纹注册（用户回复名字后调用）
+
+        Args:
+            text: 用户说的名字文本
+        """
+        # 提取名字
+        name = self._extract_name_from_text(text)
+
+        if name and self.pending_speaker_embedding is not None:
+            # 注册声纹
+            success, message = self.speaker_recognition_manager.register_speaker(
+                name, self.pending_speaker_embedding
+            )
+
+            if success:
+                print(f"[声纹识别] 声纹注册成功: {name}")
+                self._speak_text(f"好的，{name}，我记住你了！")
+            else:
+                print(f"[声纹识别] 声纹注册失败: {message}")
+                self._speak_text(f"抱歉，注册失败了：{message}")
+        else:
+            print(f"[声纹识别] 未能提取有效名字: {text}")
+            self._speak_text("抱歉，我没有听清你的名字，下次再告诉我吧。")
+
+        # 重置状态
+        self.waiting_for_speaker_name = False
+        self.pending_speaker_embedding = None
 
     def closeEvent(self, event):
         """窗口关闭事件"""

@@ -9,23 +9,40 @@ requests>=2.31.0
 websockets>=11.0.3
 
 # ==================== 音频处理 ====================
-# 注意: pyaudio 安装可能需要额外步骤（见 README）
+# pyaudio: 麦克风录音
+# Windows: pip install pyaudio
+# macOS: brew install portaudio && pip install pyaudio
+# Linux: sudo apt-get install portaudio19-dev && pip install pyaudio
 pyaudio>=0.2.13
+
+# pygame: 音频播放
 pygame>=2.5.2
 
 # ==================== 计算机视觉 ====================
-opencv-python>=4.8.0  # 摄像头拍照功能
+# OpenCV: 摄像头拍照功能
+opencv-python>=4.8.0
 
 # ==================== 人脸识别 ====================
-# 注意: face_recognition 依赖 dlib，Windows 安装可能需要：
-# 1. 安装 Visual Studio Build Tools
-# 2. 或使用预编译包: pip install dlib-bin
+# face_recognition 依赖 dlib
+# Windows 安装方式（推荐）:
+#   pip install dlib-bin
+#   pip install face_recognition
+# macOS/Linux:
+#   brew install cmake  (macOS)
+#   pip install face_recognition
 face_recognition>=1.3.0
 numpy>=1.24.0
 
 # ==================== 物体检测 ====================
-# YOLOv8 物体检测（首次运行会自动下载模型）
+# YOLOv8 物体检测
+# 首次运行会自动下载模型（yolov8n.pt 约 6MB）
 ultralytics>=8.0.0
+
+# ==================== 声纹识别 ====================
+# Resemblyzer: 基于 d-vector 的说话人识别
+# 特点: 轻量级，可在 CPU 上运行
+# 依赖: torch, librosa, webrtcvad
+resemblyzer>=0.1.4
 
 # ==================== 可选依赖 ====================
 # python-dotenv>=1.0.0  # 如需从 .env 文件加载环境变量
