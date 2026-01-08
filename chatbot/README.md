@@ -1,6 +1,6 @@
 # 豆包语音助手 Demo
 
-基于火山引擎豆包大模型的多模态语音助手演示程序，集成了语音识别（ASR）、对话生成（Chat）、语音合成（TTS）、人脸识别、物体检测和声纹识别六大功能。
+基于火山引擎豆包大模型的多模态语音助手演示程序，集成了语音识别（ASR）、对话生成（Chat）、语音合成（TTS）、人脸识别、物体检测、声纹识别和智能记忆七大功能。
 
 ## 功能特性
 
@@ -19,6 +19,12 @@
 - **说话人识别**：基于 Resemblyzer 的 d-vector 嵌入
 - **自动注册**：首次对话后自动询问名字并记录声纹
 - **身份识别**：再次对话时自动识别说话人
+
+### 智能记忆（Mem0）
+- **长期记忆**：基于 Mem0 服务存储用户偏好和重要信息
+- **关键信息提取**：自动从对话中提取喜好、关系、事实等
+- **上下文注入**：对话前自动搜索相关记忆，提供个性化回复
+- **身份关联**：记忆与声纹识别联动，为每个用户维护独立记忆
 
 ### 交互优化
 - **静音检测**：自动检测静音并结束录音
@@ -124,6 +130,7 @@ chatbot/
 ├── face_recognition_utils.py # 人脸识别模块
 ├── object_detection_utils.py # YOLO 物体检测模块
 ├── speaker_recognition_utils.py # 声纹识别模块
+├── mem0_client.py            # Mem0 记忆服务客户端
 │
 ├── faces/                    # 人脸数据存储目录
 │   └── encodings.json        # 已注册的人脸编码
@@ -160,6 +167,15 @@ FACE_RECOGNITION_TOLERANCE = 0.6  # 匹配容差（0.4-0.6，越小越严格）
 FACE_RECOGNITION_MODEL = "hog"    # 检测模型（hog快/cnn准）
 ```
 
+### 智能记忆 (`config.py`)
+
+```python
+MEM0_BASE_URL = "http://tenyuan.tech:9000"  # Mem0 服务地址
+MEM0_ENABLED = True                          # 是否启用记忆功能
+MEM0_SEARCH_TOP_K = 5                        # 搜索返回的最大记忆条数
+MEM0_SIMILARITY_THRESHOLD = 0.5              # 记忆相似度阈值
+```
+
 ### TTS 音色
 
 2.0 版本音色（需配合 `seed-tts-2.0`）：
@@ -184,6 +200,7 @@ FACE_RECOGNITION_MODEL = "hog"    # 检测模型（hog快/cnn准）
 | `FaceRecognitionManager` | 人脸识别管理器 |
 | `ObjectDetector` | YOLO 物体检测器 |
 | `SpeakerRecognitionManager` | 声纹识别管理器 |
+| `Mem0Client` | Mem0 记忆服务客户端 |
 
 ## 数据流程
 
@@ -205,14 +222,24 @@ AudioRecorder 采集音频
     ├─ "记住我" → 拍照 + 人脸编码 → 追问名字
     └─ 默认 → 纯文本对话
     ↓
+┌─────────────────────────────────────┐
+│ Mem0 搜索相关记忆                    │
+│ → 注入上下文到 Chat 请求             │
+└─────────────────────────────────────┘
+    ↓
 ChatWorker 流式请求 → Doubao-Seed-1.6 API
+    ↓
+┌─────────────────────────────────────┐
+│ Mem0 异步存储（后台线程）            │
+│ → 提取关键信息 → 存储到记忆服务       │
+└─────────────────────────────────────┘
     ↓
 StreamingTTSWorker 流式合成 → 豆包 TTS API
     ↓
 pygame 播放音频
     ↓
 播放完成检查
-    ├─ 有待注册声纹 → 追问名字 → 注册
+    ├─ 有待注册声纹 → 追问名字 → 注册 → 迁移记忆
     └─ 无 → 恢复初始状态
 ```
 
@@ -255,6 +282,18 @@ pip install face_recognition
 ### 7. ImportError: 请先创建 api_secrets.py 文件
 
 按照"配置 API 密钥"步骤，复制 `api_secrets.example.py` 为 `api_secrets.py` 并填入真实密钥。
+
+### 8. Mem0 服务连接失败
+
+- 检查 `MEM0_BASE_URL` 是否正确
+- 确认 Mem0 服务是否正常运行：`curl http://tenyuan.tech:9000/health`
+- 如需禁用记忆功能，设置 `MEM0_ENABLED = False`
+
+### 9. 记忆功能不生效
+
+- 确认 `MEM0_ENABLED = True`
+- 声纹识别正常工作后才会有 `current_user_id`
+- 检查控制台是否有 `[Mem0]` 相关日志
 
 ## 许可证
 

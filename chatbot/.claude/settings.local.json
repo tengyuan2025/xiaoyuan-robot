@@ -22,7 +22,10 @@
       "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\python.exe\" -m py_compile E:claude_projectsevexiaoyuan-robotchatbotconfig.py)",
       "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\python.exe\" -m py_compile \"E:\\\\claude_projects\\\\eve\\\\xiaoyuan-robot\\\\chatbot\\\\speaker_recognition_utils.py\")",
       "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\python.exe\" -m py_compile \"E:\\\\claude_projects\\\\eve\\\\xiaoyuan-robot\\\\chatbot\\\\voice_assistant.py\")",
-      "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\python.exe\" -m py_compile \"E:\\\\claude_projects\\\\eve\\\\xiaoyuan-robot\\\\chatbot\\\\config.py\")"
+      "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\python.exe\" -m py_compile \"E:\\\\claude_projects\\\\eve\\\\xiaoyuan-robot\\\\chatbot\\\\config.py\")",
+      "WebFetch(domain:tenyuan.tech)",
+      "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\python.exe\" -m py_compile \"E:\\\\claude_projects\\\\eve\\\\xiaoyuan-robot\\\\chatbot\\\\mem0_client.py\")",
+      "Bash(\"C:\\\\Users\\\\linan\\\\Envs\\\\chatbot\\\\Scripts\\\\python.exe\" -m py_compile \"E:\\\\claude_projects\\\\eve\\\\xiaoyuan-robot\\\\chatbot\\\\intent_handler.py\")"
     ]
   }
 }

@@ -1,0 +1,34 @@
+# 嵌入式机器人依赖
+# 适用于 RK3568 Ubuntu 20.04 aarch64
+
+# === 网络通信 ===
+requests>=2.31.0
+websockets>=11.0.3
+aiohttp>=3.9.0
+
+# === 音频处理 ===
+# pyaudio 需要系统安装 portaudio: sudo apt install portaudio19-dev
+pyaudio>=0.2.13
+
+# === 视觉处理 ===
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# === 人脸识别 (可选) ===
+# face_recognition 需要先安装 dlib
+# ARM64 需要从源码编译 dlib
+# pip install dlib
+# pip install face_recognition
+
+# === 物体检测 (可选) ===
+# ultralytics>=8.0.0
+
+# === 声纹识别 (可选) ===
+# resemblyzer>=0.1.4
+# webrtcvad>=2.0.10
+
+# === 雷达 (可选) ===
+rplidar-roboticia>=0.9.6
+
+# === 串口通信 ===
+pyserial>=3.5

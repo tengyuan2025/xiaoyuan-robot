@@ -83,6 +83,13 @@ from object_detection_utils import ObjectDetector, check_yolo_available
 # 导入声纹识别模块
 from speaker_recognition_utils import SpeakerRecognitionManager, check_resemblyzer_available
 
+# 导入 Mem0 记忆模块
+from mem0_client import Mem0Client, get_mem0_client
+from config import (
+    MEM0_ENABLED, MEM0_CONTEXT_TEMPLATE, MEM0_EXTRACTION_PROMPT,
+    MEM0_SIMILARITY_THRESHOLD
+)
+
 
 # ==================== 信号类（用于线程间通信） ====================
 class WorkerSignals(QObject):
@@ -711,11 +718,13 @@ class ChatWorker(QThread):
         self.history: List[Dict[str, str]] = []
         self.is_running = True
         self.use_image_analysis_mode = False     # 强制使用非流式模式
+        self.memory_context: Optional[str] = None  # Mem0 记忆上下文
 
     def set_input(self, text: str, history: List[Dict[str, str]] = None,
                   image_base64: Optional[str] = None,
                   image_path: Optional[str] = None,
-                  use_image_analysis_mode: bool = False):
+                  use_image_analysis_mode: bool = False,
+                  memory_context: Optional[str] = None):
         """
         设置用户输入和对话历史
 
@@ -725,12 +734,14 @@ class ChatWorker(QThread):
             image_base64: 图片的Base64编码（可选，用于图文分析）
             image_path: 临时图片路径（可选，用于清理）
             use_image_analysis_mode: 强制使用非流式图文分析模式（用于提示词中已包含图片的情况）
+            memory_context: 记忆上下文（可选，用于注入用户相关信息）
         """
         self.user_input = text
         self.history = history or []
         self.image_base64 = image_base64
         self.image_path = image_path
         self.use_image_analysis_mode = use_image_analysis_mode
+        self.memory_context = memory_context
 
     def stop(self):
         """停止对话"""
@@ -876,7 +887,18 @@ class ChatWorker(QThread):
 
         # 构造请求体（精简历史，只保留最近2轮对话）
         recent_history = self.history[-4:] if len(self.history) > 4 else self.history
-        messages = recent_history + [{"role": "user", "content": self.user_input}]
+
+        # 构建消息列表
+        messages = []
+
+        # 如果有记忆上下文，作为系统消息注入
+        if self.memory_context:
+            messages.append({"role": "system", "content": self.memory_context})
+            print(f"[Chat] 注入记忆上下文: {len(self.memory_context)} 字符")
+
+        # 添加历史对话和当前用户输入
+        messages.extend(recent_history)
+        messages.append({"role": "user", "content": self.user_input})
 
         data = {
             "model": CHAT_MODEL_NAME,
@@ -892,16 +914,54 @@ class ChatWorker(QThread):
 
         print(f"[Chat] 发送流式请求: model={CHAT_MODEL_NAME}, stream={CHAT_STREAM}")
 
-        try:
-            response = requests.post(
-                CHAT_API_URL,
-                headers=headers,
-                data=json.dumps(data),
-                timeout=REQUEST_TIMEOUT,
-                stream=True  # 开启流式响应
-            )
-            response.raise_for_status()
+        # 指数退避重试（处理 429 限流错误）
+        max_retries = MAX_RETRIES
+        base_delay = 1.0  # 初始等待时间（秒）
+        response = None
 
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(
+                    CHAT_API_URL,
+                    headers=headers,
+                    data=json.dumps(data),
+                    timeout=REQUEST_TIMEOUT,
+                    stream=True  # 开启流式响应
+                )
+
+                # 处理 429 限流错误
+                if response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)  # 指数退避: 1s, 2s, 4s...
+                        print(f"[Chat] 触发限流 (429)，第 {attempt + 1} 次重试，等待 {delay:.1f}s...")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        print(f"[Chat] 限流重试次数已达上限 ({max_retries})")
+                        return None
+
+                response.raise_for_status()
+                break  # 请求成功，跳出重试循环
+
+            except requests.exceptions.Timeout:
+                print(f"[Chat] 流式请求超时")
+                return None
+            except requests.exceptions.RequestException as e:
+                # 检查是否是 429 错误需要重试
+                if hasattr(e, 'response') and e.response is not None and e.response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)
+                        print(f"[Chat] 触发限流 (429)，第 {attempt + 1} 次重试，等待 {delay:.1f}s...")
+                        time.sleep(delay)
+                        continue
+                print(f"[Chat] 流式请求异常: {e}")
+                return None
+
+        # 请求成功后处理响应
+        if response is None:
+            return None
+
+        try:
             full_reply = ""
 
             # 逐行解析流式返回
@@ -951,12 +1011,6 @@ class ChatWorker(QThread):
 
             return full_reply if full_reply else None
 
-        except requests.exceptions.Timeout:
-            print(f"[Chat] 流式请求超时")
-            return None
-        except requests.exceptions.RequestException as e:
-            print(f"[Chat] 流式请求异常: {e}")
-            return None
         except Exception as e:
             print(f"[Chat] 流式处理异常: {e}")
             import traceback
@@ -1371,8 +1425,11 @@ class StreamingTTSWorker(QThread):
     实现"边生成边播放"，大幅减少等待时间
     """
 
-    # 句子分隔符（按这些标点切分）
+    # 句子分隔符（只用句末标点，保持句子完整性和自然语调）
     SENTENCE_DELIMITERS = ["。", "！", "？", "；", "\n", "!", "?", ";"]
+
+    # 最大缓冲字数（禁用，设为很大的值）
+    MAX_BUFFER_CHARS = 9999
 
     def __init__(self, signals: WorkerSignals):
         super().__init__()
@@ -1398,6 +1455,9 @@ class StreamingTTSWorker(QThread):
         self.EVENT_TASK_REQUEST = 200
         self.EVENT_TTS_RESPONSE = 352
 
+        # 连接预热相关
+        self.warmup_done = threading.Event()  # 预热完成信号
+
     def add_text_chunk(self, chunk: str):
         """
         接收文本片段，累积到缓冲区并尝试切分句子
@@ -1420,6 +1480,15 @@ class StreamingTTSWorker(QThread):
                         split_idx = idx
 
             if split_idx == -1:
+                # 没有找到标点，检查是否超过最大缓冲字数
+                if len(self.text_buffer) >= self.MAX_BUFFER_CHARS:
+                    # 强制触发 TTS（按字数切分）
+                    sentence = self.text_buffer[:self.MAX_BUFFER_CHARS].strip()
+                    self.text_buffer = self.text_buffer[self.MAX_BUFFER_CHARS:]
+                    if sentence:
+                        print(f"[StreamingTTS] 字数触发合成: {sentence}")
+                        self._start_tts_synthesis(sentence, self.chunk_id)
+                        self.chunk_id += 1
                 break
 
             # 提取完整句子（包含分隔符）
@@ -1474,32 +1543,35 @@ class StreamingTTSWorker(QThread):
             print(f"[StreamingTTS] 跳过无效片段 {chunk_id}: {text}")
             return
 
-        print(f"[StreamingTTS] 合成片段 {chunk_id}: {text[:30]}...")
+        start_time = time.time()
+        print(f"[StreamingTTS] 开始合成片段 {chunk_id}: \"{text}\" (时间戳: {start_time:.3f})")
         tts_thread = threading.Thread(
             target=self._synthesize_chunk,
-            args=(text, chunk_id),
+            args=(text, chunk_id, start_time),
             daemon=True
         )
         self.tts_threads.append(tts_thread)
         tts_thread.start()
 
-    def _synthesize_chunk(self, text: str, chunk_id: int):
+    def _synthesize_chunk(self, text: str, chunk_id: int, start_time: float = 0):
         """
         合成单个文本片段的音频
 
         Args:
             text: 待合成文本
             chunk_id: 片段序号
+            start_time: 开始时间戳（用于计时）
         """
         try:
             # 使用 asyncio 运行异步合成
             audio_data = asyncio.run(self._tts_async(text))
+            duration = (time.time() - start_time) * 1000 if start_time else 0
             if audio_data:
                 # 放入队列（带序号保证顺序）
                 self.audio_queue.put((chunk_id, audio_data))
-                print(f"[StreamingTTS] 片段 {chunk_id} 合成完成，{len(audio_data)} 字节")
+                print(f"[StreamingTTS] 片段 {chunk_id} 合成完成: {len(audio_data)} 字节, 耗时 {duration:.0f}ms")
             else:
-                print(f"[StreamingTTS] 片段 {chunk_id} 合成失败")
+                print(f"[StreamingTTS] 片段 {chunk_id} 合成失败, 耗时 {duration:.0f}ms")
         except Exception as e:
             print(f"[StreamingTTS] 片段 {chunk_id} 合成异常: {e}")
 
@@ -1698,6 +1770,10 @@ class StreamingTTSWorker(QThread):
         self.is_running = True
         self.first_audio_played = False  # 标记是否已播放第一个音频
 
+        # 启动预热线程（预先建立 TTS 连接，减少首次延迟）
+        warmup_thread = threading.Thread(target=self._warmup_connection, daemon=True)
+        warmup_thread.start()
+
         # 启动播放线程
         self.play_thread = threading.Thread(target=self._play_audio_queue, daemon=True)
         self.play_thread.start()
@@ -1707,6 +1783,23 @@ class StreamingTTSWorker(QThread):
 
         if self.is_running:
             self.signals.tts_finished.emit()
+
+    def _warmup_connection(self):
+        """
+        预热 TTS 连接（在后台建立一次连接，预热 DNS/TLS 缓存）
+        这样第一个真实 TTS 请求会更快
+        """
+        try:
+            warmup_start = time.time()
+            print("[StreamingTTS] 开始预热 TTS 连接...")
+            # 合成一个极短的文本来预热连接
+            asyncio.run(self._tts_async("。"))
+            warmup_time = (time.time() - warmup_start) * 1000
+            print(f"[StreamingTTS] TTS 连接预热完成，耗时 {warmup_time:.0f}ms")
+            self.warmup_done.set()
+        except Exception as e:
+            print(f"[StreamingTTS] TTS 预热失败: {e}")
+            self.warmup_done.set()  # 即使失败也标记完成，避免阻塞
 
     def _play_audio_queue(self):
         """消费音频队列，按顺序无缝播放"""
@@ -1877,12 +1970,27 @@ class VoiceAssistantWindow(QMainWindow):
         self.current_speaker_name: Optional[str] = None  # 当前识别的说话人
         self.pending_speaker_embedding = None            # 待注册的声纹嵌入向量
         self.waiting_for_speaker_name = False            # 是否在等待用户说名字
+        self.waiting_for_other_speaker = False           # 是否在等待他人说话（两轮对话模式）
+        self._last_audio_bytes: Optional[bytes] = None   # 最近一次录音的原始音频数据
+
+        # Mem0 记忆服务
+        self.mem0_client = get_mem0_client() if MEM0_ENABLED else None
+        self.current_user_id: Optional[str] = None       # 当前用户 ID（用于 Mem0）
+        self.temp_user_id: Optional[str] = None          # 临时用户 ID（未注册用户）
 
         # 计时统计（用于性能分析）
         self.time_asr_end = 0.0          # 语音识别完成时间
+        self.time_mem0_search = 0.0      # Mem0 搜索耗时（毫秒）
         self.time_chat_first = 0.0       # Chat第一个chunk到达时间
         self.time_tts_first_synth = 0.0  # TTS第一个片段合成完成时间
         self.time_tts_play_start = 0.0   # TTS开始播放时间
+        self.time_mem0_store = 0.0       # Mem0 存储耗时（毫秒）
+        self.time_mem0_extract = 0.0     # Mem0 关键信息提取耗时（毫秒）
+        self.time_voice_extract = 0.0    # 声纹提取耗时（毫秒）
+        self.time_voice_match = 0.0      # 声纹匹配耗时（毫秒）
+        self.time_camera = 0.0           # 摄像头拍照耗时（毫秒）
+        self.time_face_detect = 0.0      # 人脸检测/识别耗时（毫秒）
+        self.time_object_detect = 0.0    # 物体检测耗时（毫秒）
         self.is_first_chunk = True       # 是否第一个chunk
 
         # 初始化界面
@@ -1987,27 +2095,86 @@ class VoiceAssistantWindow(QMainWindow):
                 padding: 5px;
             }
         """)
-        timing_layout = QHBoxLayout(timing_frame)
-        timing_layout.setContentsMargins(10, 5, 10, 5)
-        timing_layout.setSpacing(20)
+        timing_main_layout = QVBoxLayout(timing_frame)
+        timing_main_layout.setContentsMargins(10, 5, 10, 5)
+        timing_main_layout.setSpacing(3)
 
-        # 各阶段耗时标签
+        # 第一行：核心延迟指标
+        timing_row1 = QHBoxLayout()
+        timing_row1.setSpacing(20)
+
         self.timing_asr_chat = QLabel("ASR→首字: --")
         self.timing_asr_chat.setFont(QFont("Microsoft YaHei", 9))
         self.timing_asr_chat.setStyleSheet("color: #795548; border: none;")
-        timing_layout.addWidget(self.timing_asr_chat)
+        timing_row1.addWidget(self.timing_asr_chat)
 
         self.timing_chat_tts = QLabel("首字→播放: --")
         self.timing_chat_tts.setFont(QFont("Microsoft YaHei", 9))
         self.timing_chat_tts.setStyleSheet("color: #795548; border: none;")
-        timing_layout.addWidget(self.timing_chat_tts)
+        timing_row1.addWidget(self.timing_chat_tts)
 
         self.timing_total = QLabel("总延时: --")
         self.timing_total.setFont(QFont("Microsoft YaHei", 9, QFont.Weight.Bold))
         self.timing_total.setStyleSheet("color: #e65100; border: none;")
-        timing_layout.addWidget(self.timing_total)
+        timing_row1.addWidget(self.timing_total)
 
-        timing_layout.addStretch()
+        timing_row1.addStretch()
+        timing_main_layout.addLayout(timing_row1)
+
+        # 第二行：声纹识别 + 图像识别耗时
+        timing_row2 = QHBoxLayout()
+        timing_row2.setSpacing(15)
+
+        self.timing_voice_extract = QLabel("声纹提取: --")
+        self.timing_voice_extract.setFont(QFont("Microsoft YaHei", 9))
+        self.timing_voice_extract.setStyleSheet("color: #9C27B0; border: none;")
+        timing_row2.addWidget(self.timing_voice_extract)
+
+        self.timing_voice_match = QLabel("声纹匹配: --")
+        self.timing_voice_match.setFont(QFont("Microsoft YaHei", 9))
+        self.timing_voice_match.setStyleSheet("color: #9C27B0; border: none;")
+        timing_row2.addWidget(self.timing_voice_match)
+
+        self.timing_camera = QLabel("拍照: --")
+        self.timing_camera.setFont(QFont("Microsoft YaHei", 9))
+        self.timing_camera.setStyleSheet("color: #2196F3; border: none;")
+        timing_row2.addWidget(self.timing_camera)
+
+        self.timing_face_detect = QLabel("人脸: --")
+        self.timing_face_detect.setFont(QFont("Microsoft YaHei", 9))
+        self.timing_face_detect.setStyleSheet("color: #2196F3; border: none;")
+        timing_row2.addWidget(self.timing_face_detect)
+
+        self.timing_object_detect = QLabel("物体: --")
+        self.timing_object_detect.setFont(QFont("Microsoft YaHei", 9))
+        self.timing_object_detect.setStyleSheet("color: #2196F3; border: none;")
+        timing_row2.addWidget(self.timing_object_detect)
+
+        timing_row2.addStretch()
+        timing_main_layout.addLayout(timing_row2)
+
+        # 第三行：Mem0 模块耗时
+        timing_row3 = QHBoxLayout()
+        timing_row3.setSpacing(20)
+
+        self.timing_mem0_search = QLabel("记忆搜索: --")
+        self.timing_mem0_search.setFont(QFont("Microsoft YaHei", 9))
+        self.timing_mem0_search.setStyleSheet("color: #4CAF50; border: none;")
+        timing_row3.addWidget(self.timing_mem0_search)
+
+        self.timing_mem0_extract = QLabel("信息提取: --")
+        self.timing_mem0_extract.setFont(QFont("Microsoft YaHei", 9))
+        self.timing_mem0_extract.setStyleSheet("color: #4CAF50; border: none;")
+        timing_row3.addWidget(self.timing_mem0_extract)
+
+        self.timing_mem0_store = QLabel("记忆存储: --")
+        self.timing_mem0_store.setFont(QFont("Microsoft YaHei", 9))
+        self.timing_mem0_store.setStyleSheet("color: #4CAF50; border: none;")
+        timing_row3.addWidget(self.timing_mem0_store)
+
+        timing_row3.addStretch()
+        timing_main_layout.addLayout(timing_row3)
+
         bottom_layout.addWidget(timing_frame)
 
         # 状态显示
@@ -2248,35 +2415,65 @@ class VoiceAssistantWindow(QMainWindow):
         """
         print(f"[声纹识别] 收到音频数据: {len(audio_bytes)} 字节")
 
+        # 保存原始音频数据（用于声纹识别他人模式）
+        self._last_audio_bytes = audio_bytes
+
+        # 如果正在等待他人说话（两轮对话模式），只保存音频，不进行匹配
+        if self.waiting_for_other_speaker:
+            print("[声纹识别] 正在等待他人说话模式，仅保存音频，跳过匹配")
+            self.timing_voice_extract.setText("声纹提取: 待识别")
+            self.timing_voice_match.setText("声纹匹配: 待识别")
+            return
+
         # 如果正在等待用户说名字，不进行声纹匹配（避免覆盖状态）
         if self.waiting_for_speaker_name:
             print("[声纹识别] 正在等待用户说名字，跳过声纹匹配")
+            self.timing_voice_extract.setText("声纹提取: 跳过")
+            self.timing_voice_match.setText("声纹匹配: 跳过")
             return
 
-        # 提取声纹嵌入向量
+        # 提取声纹嵌入向量（带计时）
+        extract_start = time.time()
         embedding = self.speaker_recognition_manager.extract_embedding(
             audio_bytes, sample_rate=AUDIO_RATE
         )
+        self.time_voice_extract = (time.time() - extract_start) * 1000
+        self.timing_voice_extract.setText(f"声纹提取: {self.time_voice_extract:.0f}ms")
+        print(f"[计时] 声纹提取: {self.time_voice_extract:.0f}ms")
 
         if embedding is None:
             print("[声纹识别] 提取声纹失败（音频太短或无效）")
+            self.timing_voice_extract.setText(f"声纹提取: 失败")
+            self.timing_voice_match.setText("声纹匹配: --")
             self.current_speaker_name = None
             self.pending_speaker_embedding = None
             return
 
-        # 匹配说话人
+        # 匹配说话人（带计时）
+        match_start = time.time()
         name, similarity = self.speaker_recognition_manager.match_speaker(embedding)
+        self.time_voice_match = (time.time() - match_start) * 1000
+        print(f"[计时] 声纹匹配: {self.time_voice_match:.0f}ms")
 
         if name:
             # 识别到已知说话人
             self.current_speaker_name = name
+            self.current_user_id = name  # 使用说话人名字作为 Mem0 user_id
             self.pending_speaker_embedding = None
+            self.temp_user_id = None  # 清除临时 ID
+            self.timing_voice_match.setText(f"声纹匹配: {self.time_voice_match:.0f}ms ({name})")
             print(f"[声纹识别] 识别到说话人: {name} (相似度: {similarity:.3f})")
         else:
             # 未知说话人，暂存声纹待注册
             self.current_speaker_name = None
             self.pending_speaker_embedding = embedding
+            # 为未知用户生成临时 ID（如果还没有的话）
+            if not self.temp_user_id:
+                self.temp_user_id = Mem0Client.generate_temp_user_id()
+            self.current_user_id = self.temp_user_id
+            self.timing_voice_match.setText(f"声纹匹配: {self.time_voice_match:.0f}ms (未知)")
             print(f"[声纹识别] 未知说话人，暂存声纹待注册 (最高相似度: {similarity:.3f})")
+            print(f"[Mem0] 使用临时用户 ID: {self.temp_user_id}")
 
     def _extract_name_from_text(self, text: str) -> Optional[str]:
         """
@@ -2324,6 +2521,15 @@ class VoiceAssistantWindow(QMainWindow):
         self.timing_asr_chat.setText("ASR→首字: 计时中...")
         self.timing_chat_tts.setText("首字→播放: --")
         self.timing_total.setText("总延时: --")
+        # 声纹识别耗时已在 _on_asr_audio_data 中更新，此处不重置
+        # 图像识别耗时
+        self.timing_camera.setText("拍照: --")
+        self.timing_face_detect.setText("人脸: --")
+        self.timing_object_detect.setText("物体: --")
+        # Mem0 耗时
+        self.timing_mem0_search.setText("记忆搜索: --")
+        self.timing_mem0_extract.setText("信息提取: --")
+        self.timing_mem0_store.setText("记忆存储: --")
 
         # 更新按钮状态
         self.mic_button.setText("🎤 点击说话")
@@ -2341,6 +2547,11 @@ class VoiceAssistantWindow(QMainWindow):
                 self._complete_speaker_registration(final_text)
                 return
 
+            # ========== 检查是否在等待他人说话（声纹识别他人模式） ==========
+            if self.waiting_for_other_speaker:
+                self._identify_other_speaker()
+                return
+
             # ========== 意图判断 ==========
             self.status_label.setText("正在分析意图...")
             QApplication.processEvents()
@@ -2348,13 +2559,24 @@ class VoiceAssistantWindow(QMainWindow):
             intent_result = self.intent_handler.process(final_text)
             print(f"[UI] 意图判断结果: {intent_result.intent_type.value}")
 
+            # 更新图像识别耗时显示
+            if intent_result.time_camera > 0:
+                self.time_camera = intent_result.time_camera
+                self.timing_camera.setText(f"拍照: {self.time_camera:.0f}ms")
+            if intent_result.time_face_detect > 0:
+                self.time_face_detect = intent_result.time_face_detect
+                self.timing_face_detect.setText(f"人脸: {self.time_face_detect:.0f}ms")
+            if intent_result.time_object_detect > 0:
+                self.time_object_detect = intent_result.time_object_detect
+                self.timing_object_detect.setText(f"物体: {self.time_object_detect:.0f}ms")
+
             # 处理意图结果
-            if intent_result.intent_type == IntentType.FACE_REGISTER:
-                # 人脸注册意图
-                self._handle_face_register_result(intent_result, final_text)
-            elif intent_result.intent_type == IntentType.FACE_RECOGNIZE:
-                # 人脸识别意图
-                self._handle_face_recognize_result(intent_result, final_text)
+            if intent_result.intent_type == IntentType.SPEAKER_IDENTIFY_OTHER:
+                # 声纹识别他人意图（两轮对话模式）
+                self._handle_speaker_identify_other_result(intent_result, final_text)
+            elif intent_result.intent_type == IntentType.SPEAKER_IDENTIFY:
+                # 声纹识别意图（识别当前说话人）
+                self._handle_speaker_identify_result(intent_result, final_text)
             elif intent_result.intent_type == IntentType.LOOK:
                 # 看相关意图 - 本地识别模式（人脸 + YOLO）
                 self._handle_look_result(intent_result, final_text)
@@ -2447,6 +2669,119 @@ class VoiceAssistantWindow(QMainWindow):
 
         self.ai_text.setText(result_msg)
         self._speak_text(result_msg)
+
+    def _handle_speaker_identify_other_result(self, intent_result: IntentResult, original_text: str):
+        """
+        处理声纹识别他人意图结果（两轮对话模式 - 第一轮）
+
+        设置等待状态，提示用户让对方说话
+
+        Args:
+            intent_result: 意图判断结果
+            original_text: 用户原始输入
+        """
+        # 设置等待他人说话的状态
+        self.waiting_for_other_speaker = True
+
+        # 提示用户让对方说话
+        prompt_text = "好的，请让他说几句话，我来听听是谁"
+        self.status_label.setText("等待对方说话...")
+        self.ai_text.setText(prompt_text)
+        print("[UI] 进入声纹识别他人模式，等待对方说话")
+
+        # 语音提示
+        self._speak_text(prompt_text)
+
+    def _handle_speaker_identify_result(self, intent_result: IntentResult, original_text: str):
+        """
+        处理声纹识别意图结果（识别当前说话人）
+
+        Args:
+            intent_result: 意图判断结果
+            original_text: 用户原始输入
+        """
+        if intent_result.error_message:
+            self.status_label.setText(intent_result.error_message)
+            self.ai_text.setText(intent_result.error_message)
+            print(f"[UI] 声纹识别失败: {intent_result.error_message}")
+            self._speak_text(intent_result.error_message)
+            return
+
+        if intent_result.speaker_name:
+            # 识别成功
+            result_text = f"这是{intent_result.speaker_name}的声音"
+            if intent_result.speaker_similarity > 0:
+                result_text += f"，相似度{intent_result.speaker_similarity:.0%}"
+            self.status_label.setText(f"识别到: {intent_result.speaker_name}")
+        else:
+            # 未能识别
+            result_text = "我不认识这个人的声音"
+            if intent_result.speaker_similarity > 0:
+                result_text += f"，最高相似度只有{intent_result.speaker_similarity:.0%}"
+            self.status_label.setText("未能识别")
+
+        print(f"[UI] 声纹识别结果: {result_text}")
+        self.ai_text.setText(result_text)
+        self._speak_text(result_text)
+
+    def _identify_other_speaker(self):
+        """
+        识别他人声纹（两轮对话模式 - 第二轮）
+
+        对当前录音的音频进行声纹识别
+        """
+        # 重置等待状态
+        self.waiting_for_other_speaker = False
+
+        self.status_label.setText("正在识别声纹...")
+        QApplication.processEvents()
+
+        # 检查是否有音频数据
+        if not hasattr(self, '_last_audio_bytes') or not self._last_audio_bytes:
+            error_msg = "没有录到声音，请让他再说一次"
+            self.status_label.setText(error_msg)
+            self.ai_text.setText(error_msg)
+            self._speak_text(error_msg)
+            return
+
+        # 进行声纹识别
+        try:
+            # 提取声纹
+            identify_start = time.time()
+            embedding = self.speaker_recognition_manager.extract_embedding(self._last_audio_bytes)
+
+            if embedding is None:
+                error_msg = "没有提取到有效声纹，可能是声音太短或太小，请让他再说长一点"
+                self.status_label.setText(error_msg)
+                self.ai_text.setText(error_msg)
+                self._speak_text(error_msg)
+                return
+
+            # 匹配声纹
+            speaker_name, similarity = self.speaker_recognition_manager.match_speaker(embedding)
+            identify_time = (time.time() - identify_start) * 1000
+            print(f"[计时] 声纹识别: {identify_time:.0f}ms")
+
+            # 更新耗时显示
+            self.timing_voice_extract.setText(f"声纹提取: {identify_time:.0f}ms")
+
+            if speaker_name:
+                result_text = f"这是{speaker_name}的声音，相似度{similarity:.0%}"
+                self.status_label.setText(f"识别到: {speaker_name}")
+            else:
+                result_text = f"我不认识这个人，最高相似度只有{similarity:.0%}"
+                self.status_label.setText("未能识别")
+
+            print(f"[UI] 声纹识别他人结果: {result_text}")
+            self.ai_text.setText(result_text)
+            self._speak_text(result_text)
+
+        except Exception as e:
+            error_msg = f"声纹识别失败: {str(e)}"
+            print(f"[UI] {error_msg}")
+            self.status_label.setText(error_msg)
+            self.ai_text.setText(error_msg)
+            self._speak_text("声纹识别出现问题，请重试")
 
     def _handle_look_result(self, intent_result: IntentResult, original_text: str):
         """
@@ -2658,14 +2993,69 @@ class VoiceAssistantWindow(QMainWindow):
             image_base64: 图片的Base64编码（可选，用于图文分析）
             image_path: 临时图片路径（可选，用于清理）
         """
+        # 搜索相关记忆
+        memory_context = self._search_memories(user_input)
+
         self.chat_worker = ChatWorker(self.signals)
         self.chat_worker.set_input(
             user_input,
             self.chat_history,
             image_base64=image_base64,
-            image_path=image_path
+            image_path=image_path,
+            memory_context=memory_context
         )
         self.chat_worker.start()
+
+    def _search_memories(self, query: str) -> Optional[str]:
+        """
+        搜索相关记忆并构建上下文
+
+        Args:
+            query: 用户查询文本
+
+        Returns:
+            记忆上下文字符串，无记忆返回 None
+        """
+        if not self.mem0_client or not self.current_user_id:
+            self.timing_mem0_search.setText("记忆搜索: 跳过")
+            return None
+
+        try:
+            # 记录开始时间
+            start_time = time.time()
+
+            # 搜索相关记忆
+            memories = self.mem0_client.search_memory(self.current_user_id, query)
+
+            # 记录耗时
+            self.time_mem0_search = (time.time() - start_time) * 1000
+            self.timing_mem0_search.setText(f"记忆搜索: {self.time_mem0_search:.0f}ms")
+            print(f"[计时] 记忆搜索: {self.time_mem0_search:.0f}ms")
+
+            # 过滤低相似度记忆
+            relevant_memories = [
+                m for m in memories
+                if m.score is None or m.score >= MEM0_SIMILARITY_THRESHOLD
+            ]
+
+            if not relevant_memories:
+                self.timing_mem0_search.setText(f"记忆搜索: {self.time_mem0_search:.0f}ms (0条)")
+                return None
+
+            # 构建记忆上下文
+            memory_texts = [m.memory for m in relevant_memories]
+            memories_str = "\n".join(f"- {text}" for text in memory_texts)
+
+            # 使用模板格式化
+            context = MEM0_CONTEXT_TEMPLATE.format(memories=memories_str)
+            self.timing_mem0_search.setText(f"记忆搜索: {self.time_mem0_search:.0f}ms ({len(relevant_memories)}条)")
+            print(f"[Mem0] 找到 {len(relevant_memories)} 条相关记忆")
+            return context
+
+        except Exception as e:
+            print(f"[Mem0] 搜索记忆失败: {e}")
+            self.timing_mem0_search.setText("记忆搜索: 失败")
+            return None
 
     def _on_chat_thinking(self):
         """AI 正在思考，同时启动流式 TTS"""
@@ -2722,6 +3112,124 @@ class VoiceAssistantWindow(QMainWindow):
         # 限制历史长度（保留最近 10 轮对话）
         if len(self.chat_history) > 20:
             self.chat_history = self.chat_history[-20:]
+
+        # 异步存储记忆（在后台线程中执行，不阻塞 UI）
+        self._store_memory_async(self.current_asr_text, reply)
+
+    def _store_memory_async(self, user_message: str, assistant_message: str):
+        """
+        异步存储对话记忆
+
+        在后台线程中提取关键信息并存储到 Mem0
+
+        Args:
+            user_message: 用户消息
+            assistant_message: 助手回复
+        """
+        if not self.mem0_client or not self.current_user_id:
+            return
+
+        # 保存 window 引用，用于在线程中更新 UI
+        window = self
+
+        def store_task():
+            try:
+                # 提取关键信息（带计时）
+                extract_start = time.time()
+                key_info = window._extract_key_info(user_message, assistant_message)
+                extract_time = (time.time() - extract_start) * 1000
+                window.time_mem0_extract = extract_time
+                print(f"[计时] 信息提取: {extract_time:.0f}ms")
+
+                # 使用 QTimer 在主线程中更新 UI
+                QTimer.singleShot(0, lambda: window.timing_mem0_extract.setText(
+                    f"信息提取: {extract_time:.0f}ms"
+                ))
+
+                if key_info and key_info.strip() and key_info != "无":
+                    # 存储记忆（带计时）
+                    store_start = time.time()
+                    window.mem0_client.add_memory(
+                        window.current_user_id,
+                        [
+                            {"role": "user", "content": user_message},
+                            {"role": "assistant", "content": assistant_message},
+                            {"role": "system", "content": f"提取的关键信息：{key_info}"}
+                        ]
+                    )
+                    store_time = (time.time() - store_start) * 1000
+                    window.time_mem0_store = store_time
+                    print(f"[计时] 记忆存储: {store_time:.0f}ms")
+                    print(f"[Mem0] 已存储记忆: {key_info[:50]}...")
+
+                    # 使用 QTimer 在主线程中更新 UI
+                    QTimer.singleShot(0, lambda: window.timing_mem0_store.setText(
+                        f"记忆存储: {store_time:.0f}ms"
+                    ))
+                else:
+                    print("[Mem0] 对话中无需记忆的关键信息")
+                    QTimer.singleShot(0, lambda: window.timing_mem0_store.setText(
+                        "记忆存储: 跳过"
+                    ))
+
+            except Exception as e:
+                print(f"[Mem0] 存储记忆失败: {e}")
+                QTimer.singleShot(0, lambda: window.timing_mem0_store.setText(
+                    "记忆存储: 失败"
+                ))
+
+        # 在后台线程中执行
+        threading.Thread(target=store_task, daemon=True).start()
+
+    def _extract_key_info(self, user_message: str, assistant_message: str) -> Optional[str]:
+        """
+        使用 AI 提取对话中的关键信息
+
+        Args:
+            user_message: 用户消息
+            assistant_message: 助手回复
+
+        Returns:
+            提取的关键信息字符串，无关键信息返回 None
+        """
+        try:
+            # 构建提取提示词
+            prompt = MEM0_EXTRACTION_PROMPT.format(
+                user_message=user_message,
+                assistant_message=assistant_message
+            )
+
+            # 调用 Chat API 提取关键信息（简短请求）
+            headers = {
+                "Authorization": f"Bearer {CHAT_API_KEY}",
+                "Content-Type": "application/json"
+            }
+
+            data = {
+                "model": CHAT_MODEL_NAME,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_completion_tokens": 100,
+                "temperature": 0.1,
+                "stream": False
+            }
+
+            response = requests.post(
+                CHAT_API_URL,
+                headers=headers,
+                data=json.dumps(data),
+                timeout=10
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                return content.strip()
+
+            return None
+
+        except Exception as e:
+            print(f"[Mem0] 提取关键信息失败: {e}")
+            return None
 
     def _on_chat_error(self, error: str):
         """对话模型错误"""
@@ -2815,6 +3323,20 @@ class VoiceAssistantWindow(QMainWindow):
 
             if success:
                 print(f"[声纹识别] 声纹注册成功: {name}")
+
+                # 迁移临时用户的记忆到正式用户
+                if self.mem0_client and self.temp_user_id:
+                    migrated = self.mem0_client.migrate_user_memories(
+                        self.temp_user_id, name
+                    )
+                    if migrated > 0:
+                        print(f"[Mem0] 已迁移 {migrated} 条记忆到用户: {name}")
+
+                # 更新当前用户 ID
+                self.current_user_id = name
+                self.temp_user_id = None
+                self.current_speaker_name = name
+
                 self._speak_text(f"好的，{name}，我记住你了！")
             else:
                 print(f"[声纹识别] 声纹注册失败: {message}")

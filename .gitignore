@@ -1,6 +1,10 @@
 # 敏感配置文件（包含 API 密钥）
 api_secrets.py
 
+# 硬件示例文档
+chatbot/docs/hardware_docs/
+robot_controller/hardware_docs/
+
 # Python
 __pycache__/
 *.py[cod]

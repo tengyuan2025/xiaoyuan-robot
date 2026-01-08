@@ -1,0 +1,19 @@
+  部署到开发板的步骤
+
+  1. 传输代码（使用U盘）：
+  # 将 robot_controller 目录复制到U盘
+  # 在开发板上挂载U盘并复制
+  cp -r /media/usb/robot_controller ~/
+  2. 运行安装脚本：
+  cd ~/robot_controller
+  chmod +x install.sh
+  ./install.sh
+  3. 配置API密钥：
+  cp api_secrets.example.py api_secrets.py
+  nano api_secrets.py
+  # 填入火山引擎的API密钥
+  4. 测试模块：
+  source ~/robot_env/bin/activate
+  python test_modules.py
+  5. 运行机器人：
+  python main.py
